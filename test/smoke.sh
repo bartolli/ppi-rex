@@ -81,6 +81,9 @@ check "run exports its own path, the runtime, and the alias to the agent" env_ex
 PPI_ALIAS=operator "$PPI" send fake1 "hello one" >/dev/null
 check "send to a starting agent queues" not_typed "hello one"
 check "queued send is logged" logged fake1 queued
+who_hints() { PPI_ALIAS=$1 "$PPI" who | grep -q "arrive only when your turn ends"; }
+check "who tells an agent with a queue to end its turn" who_hints fake1
+check "who gives no such hint to an agent without a queue" fails_with who_hints fake2
 
 "$PPI" release fake1 >/dev/null
 check "release types the queue and submits it" typed '^\[ppi from=operator to=fake1 id=[0-9a-f]*\] hello one$'
@@ -113,6 +116,7 @@ check "session start marks idle" state_is fake1 idle
 check "session start names the participant" grep -q 'participant "fake1"' <<<"$ctx"
 check "session start prints how to send" grep -q "ppi send <participant>" <<<"$ctx"
 check "session start prints the send results and loop rules" grep -q "Do not resend a queued message" <<<"$ctx"
+check "session start says to end the turn after sending" grep -q "After sending, end your turn" <<<"$ctx"
 CLAUDE_ENV_FILE="$TMP/claude.env" PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"source":"startup"}' >/dev/null
 env_resolves() {
   env -i HOME="$HOME" PATH=/usr/bin:/bin bash -c '. "$1" && [ "$(command -v ppi)" = "$2" ] && [ "$PPI_ALIAS" = fake1 ] && [ "$PPI_HOME" = "$3" ]' \

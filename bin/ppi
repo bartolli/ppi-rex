@@ -241,6 +241,10 @@ cmd_who() {
     printf '%-10s pane=%-4s state=%-9s queued=%s\n' "$alias" "$(cat "$f")" "$(state_of "$alias")" \
       "$(wc -l < "$PPI_HOME/queue/$alias" | tr -d ' ')"
   done
+  # An agent polling for its own reply cannot receive it mid-turn; say so where it is looking.
+  if [ -n "${PPI_ALIAS:-}" ] && queued "$PPI_ALIAS"; then
+    echo "ppi: messages queued for $PPI_ALIAS (you) arrive only when your turn ends; end it now instead of waiting."
+  fi
 }
 
 cmd_monitor() {
@@ -300,6 +304,7 @@ Send a message by passing the text on stdin through a heredoc with a quoted deli
   EOF
 The quoted 'EOF' makes the shell send the text exactly as written. Never put message text in double quotes: the shell runs anything inside backticks or $( ) before ppi sees it, and the text arrives mangled. Keep messages short; for large content, write a file and send its path.
 Reply to the sender only when the text asks a question or asks for a reply. To carry out an instruction to contact another participant, send to that participant, and report to the operator only when asked.
+After sending, end your turn. A reply arrives as a new turn that starts with the [ppi from=...] line. Never wait, sleep, or poll ppi who for it: a message queued for you is delivered only when your turn ends. When an instruction needs the reply, send, end your turn, and continue when the reply arrives.
 
 Send results:
 - "ppi: delivered to <name>": typed into the recipient's prompt. Nothing more to do.
