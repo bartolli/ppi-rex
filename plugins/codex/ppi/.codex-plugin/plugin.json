@@ -1,0 +1,11 @@
+{
+  "name": "ppi",
+  "version": "0.3.0",
+  "description": "Coordinate Claude and Codex turns on a local Zellij message bus.",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "ppi",
+    "shortDescription": "Idle and busy hooks for the ppi message bus",
+    "category": "Productivity"
+  }
+}

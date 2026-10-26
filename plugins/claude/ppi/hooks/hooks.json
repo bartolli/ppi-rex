@@ -1,0 +1,20 @@
+{
+  "description": "Report idle and busy state to the ppi bus and hand queued messages to Claude at the end of a turn.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook session-start", "timeout": 10 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook prompt", "timeout": 10 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook stop", "timeout": 10 }] }
+    ],
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook idle", "timeout": 10 }]
+      }
+    ]
+  }
+}

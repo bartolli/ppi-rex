@@ -1,0 +1,20 @@
+{
+  "name": "ppi",
+  "interface": {
+    "displayName": "PPI prototypes"
+  },
+  "plugins": [
+    {
+      "name": "ppi",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex/ppi"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

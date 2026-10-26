@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook session-start", "timeout": 10 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook prompt", "timeout": 10 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook stop", "timeout": 10 }] }
+    ]
+  }
+}

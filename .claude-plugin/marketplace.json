@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "ppi",
+  "owner": {
+    "name": "Angel Bartolli"
+  },
+  "plugins": [
+    {
+      "name": "ppi",
+      "source": "./plugins/claude/ppi",
+      "description": "Hooks that let the ppi Zellij message bus deliver to Claude Code only at its prompt."
+    }
+  ]
+}

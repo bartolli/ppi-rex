@@ -1,0 +1,6 @@
+{
+  "arms": [
+    { "name": "claude", "runtime": "claude", "model": "haiku" },
+    { "name": "codex", "runtime": "codex", "model": "gpt-6-luna", "profile": "supervisor" }
+  ]
+}
