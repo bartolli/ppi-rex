@@ -89,6 +89,7 @@ operator> /quit
 | `/who` | Show message count (`X/20`), participant pane IDs, states (`starting`, `idle`, `busy`), and queue depths. |
 | `/release <agent>` | Recover a stuck agent sitting at its prompt (delivers queued messages or marks it `idle`). |
 | `/quit` | Exit the operator console. |
+| *(incoming)* | Messages agents send to `operator` print in the console as they arrive, as `[ppi from=<agent> to=operator id=<id>] <msg>`. |
 | `Alt f` *(Zellij key)* | Toggle the floating **Bus Monitor** log. **Hide it with `Alt f`—do not close it**, as it also delivers messages for sandboxed agents. |
 
 ## Configuration Rules

@@ -109,6 +109,34 @@ EOF
 check "a message sent through a quoted heredoc arrives exactly as written" logged_msg "$literal"
 check "an empty message on stdin is refused" fails_with env PPI_ALIAS=operator "$PPI" send fake1 </dev/null
 
+# The console follows the bus log for messages addressed to the operator.
+eventually_in() {
+  local i
+  for i in $(seq 30); do grep -q -- "$2" "$1" 2>/dev/null && return 0; sleep 0.2; done
+  return 1
+}
+mkfifo "$TMP/console.in"
+"$PPI" console <"$TMP/console.in" >"$TMP/console.out" 2>&1 &
+console_pid=$!
+exec 7>"$TMP/console.in"
+sleep 0.5
+PPI_ALIAS=fake2 "$PPI" send operator "for the console" >/dev/null
+PPI_ALIAS=operator "$PPI" send fake1 "not for the console" >/dev/null
+check "console shows a message addressed to the operator" \
+  eventually_in "$TMP/console.out" '^\[ppi from=fake2 to=operator id=[0-9a-f]*\] for the console$'
+check "console reprints its prompt after the message" grep -q '^operator> ' "$TMP/console.out"
+check "console does not show agent-bound traffic" fails_with grep -q "not for the console" "$TMP/console.out"
+echo /quit >&7
+exec 7>&-
+wait "$console_pid" || true
+check "console exits quietly" fails_with grep -q Terminated "$TMP/console.out"
+follower_gone() {
+  local i
+  for i in $(seq 30); do pgrep -f "tail -n 0 -F $PPI_HOME/bus.jsonl" >/dev/null || return 0; sleep 0.2; done
+  return 1
+}
+check "console exit stops its bus follower" follower_gone
+
 PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"source":"compact"}' >/dev/null
 check "compaction leaves a busy agent busy" state_is fake1 busy
 ctx=$(PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"source":"startup"}')
@@ -117,6 +145,9 @@ check "session start names the participant" grep -q 'participant "fake1"' <<<"$c
 check "session start prints how to send" grep -q "ppi send <participant>" <<<"$ctx"
 check "session start prints the send results and loop rules" grep -q "Do not resend a queued message" <<<"$ctx"
 check "session start says to end the turn after sending" grep -q "After sending, end your turn" <<<"$ctx"
+check "session start says replies go to the sender, who relays" grep -q "the sender relays it" <<<"$ctx"
+check "session start says pane output reaches nobody on the bus" grep -q "Nothing you write in your own pane reaches" <<<"$ctx"
+check "session start says a reply is a ppi send" grep -q "Reply, with ppi send to the sender" <<<"$ctx"
 CLAUDE_ENV_FILE="$TMP/claude.env" PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"source":"startup"}' >/dev/null
 env_resolves() {
   env -i HOME="$HOME" PATH=/usr/bin:/bin bash -c '. "$1" && [ "$(command -v ppi)" = "$2" ] && [ "$PPI_ALIAS" = fake1 ] && [ "$PPI_HOME" = "$3" ]' \
