@@ -27,6 +27,11 @@ check() {
 }
 fails_with() { ! "$@" >/dev/null 2>&1; }
 state_is() { [ "$(cat "$PPI_HOME/state/$1")" = "$2" ]; }
+eventually_state() {
+  local i
+  for i in $(seq 30); do state_is "$1" "$2" && return 0; sleep 0.2; done
+  return 1
+}
 typed() { sleep 0.6; grep -q -- "$1" "$TYPED" 2>/dev/null; }
 not_typed() { sleep 0.6; ! grep -q -- "$1" "$TYPED" 2>/dev/null; }
 eventually_typed() {
@@ -81,18 +86,21 @@ check "run exports its own path, the runtime, and the alias to the agent" env_ex
 PPI_ALIAS=operator "$PPI" send fake1 "hello one" >/dev/null
 check "send to a starting agent queues" not_typed "hello one"
 check "queued send is logged" logged fake1 queued
-who_hints() { PPI_ALIAS=$1 "$PPI" who | grep -q "arrive only when your turn ends"; }
+who_hints() { PPI_ALIAS=$1 "$PPI" who | grep -q "arrive only after you stop"; }
 check "who tells an agent with a queue to end its turn" who_hints fake1
 check "who gives no such hint to an agent without a queue" fails_with who_hints fake2
 
 "$PPI" release fake1 >/dev/null
 check "release types the queue and submits it" typed '^\[ppi from=operator to=fake1 id=[0-9a-f]*\] hello one$'
+check "delivery appends the answer hint" typed '^\[ppi: if this needs an answer: ppi send operator, then stop\]$'
 check "delivery marks the agent busy" state_is fake1 busy
 
 PPI_ALIAS=operator "$PPI" send fake1 "hello two" >/dev/null
 stop_out=$(PPI_ALIAS=fake1 "$PPI" hook stop <<<'{}')
 blocks_with() { jq -e --arg m "$1" '.decision == "block" and (.reason | contains($m))' <<<"$stop_out" >/dev/null; }
 check "stop hook hands the queue back as a block decision" blocks_with "hello two"
+check "stop-hook delivery says it is not an error" blocks_with "not an error"
+check "stop-hook delivery carries the answer hint" blocks_with "ppi send operator, then stop"
 check "stop-hook delivery types nothing" not_typed "hello two"
 stop_out=$(PPI_ALIAS=fake1 "$PPI" hook stop <<<'{}')
 check "stop with an empty queue prints nothing" [ -z "$stop_out" ]
@@ -141,13 +149,15 @@ PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"source":"compact"}' >/dev/null
 check "compaction leaves a busy agent busy" state_is fake1 busy
 ctx=$(PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"source":"startup"}')
 check "session start marks idle" state_is fake1 idle
-check "session start names the participant" grep -q 'participant "fake1"' <<<"$ctx"
+check "session start names the participant" grep -q 'bus is "fake1"' <<<"$ctx"
+check "session start names the envelope as the trigger" grep -q '\[ppi from=<sender> to=fake1 id=<id>\]' <<<"$ctx"
 check "session start prints how to send" grep -q "ppi send <participant>" <<<"$ctx"
-check "session start prints the send results and loop rules" grep -q "Do not resend a queued message" <<<"$ctx"
-check "session start says to end the turn after sending" grep -q "After sending, end your turn" <<<"$ctx"
-check "session start says replies go to the sender, who relays" grep -q "the sender relays it" <<<"$ctx"
-check "session start says pane output reaches nobody on the bus" grep -q "Nothing you write in your own pane reaches" <<<"$ctx"
-check "session start says a reply is a ppi send" grep -q "Reply, with ppi send to the sender" <<<"$ctx"
+check "session start prints the send results and loop rules" grep -q "do not resend" <<<"$ctx"
+check "session start says stop-hook deliveries are normal" grep -q "Stop hook result" <<<"$ctx"
+check "session start says to stop after sending" grep -q "finish your response and stop" <<<"$ctx"
+check "session start says replies go to the sender, who relays" grep -q "the sender relays" <<<"$ctx"
+check "session start says the sender cannot see the pane" grep -q "cannot see your pane" <<<"$ctx"
+check "session start says a reply is a ppi send" grep -q "send the answer to the sender with ppi send" <<<"$ctx"
 CLAUDE_ENV_FILE="$TMP/claude.env" PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"source":"startup"}' >/dev/null
 env_resolves() {
   env -i HOME="$HOME" PATH=/usr/bin:/bin bash -c '. "$1" && [ "$(command -v ppi)" = "$2" ] && [ "$PPI_ALIAS" = fake1 ] && [ "$PPI_HOME" = "$3" ]' \
@@ -173,7 +183,7 @@ pending_send() {
 }
 check "a sender that cannot reach Zellij leaves the message pending" pending_send
 check "the monitor delivers pending messages" eventually_typed "via monitor"
-check "monitor delivery marks the agent busy" state_is fake1 busy
+check "monitor delivery marks the agent busy" eventually_state fake1 busy
 
 PPI_ALIAS=fake1 "$PPI" send operator "pong" >/dev/null
 check "messages to operator go to the bus log" logged operator delivered
