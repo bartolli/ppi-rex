@@ -499,6 +499,9 @@ batch_alias() { # batch -> its recipient; to is immutable, so no lock is needed 
 cmd_batch() {
   local usage="usage: ppi batch <tick <alias> [snapshot] | check <batch> [snapshot] | submitted <batch> | uncertain <batch> <reason> [detail] | requeue|dismiss <batch> | restart <alias>>"
   local sub=${1:-} a out
+  # Stopping the dispatcher signals its running call. A signal between taking a lock and recording it
+  # would leave the lock behind, and a stale .turns stops every send; each call is bounded, so it finishes.
+  trap '' INT TERM HUP
   [ $# -eq 0 ] || shift
   [ $# -ge 1 ] || die "$usage"
   init_home
@@ -691,12 +694,7 @@ cmd_who() {
     SNAP_STATUS=$REX_STATUS SNAP_PROCESS=$REX_PROCESS SNAP_REACH=$REX_REACH
     alias_jq "$alias" "who_line($operator)" -r
   done
-  if [ -f "$PPI_HOME/dispatcher.lock/owner" ]; then
-    printf 'dispatcher: block=%s heartbeat=%s\n' "$(jq -r '.block // "unknown"' "$PPI_HOME/dispatcher.lock/owner" 2>/dev/null || echo unknown)" \
-      "$(perl -e '@s = stat shift; print @s ? int(time - $s[9]) . "s ago" : "none"' "$PPI_HOME/heartbeat")"
-  else
-    echo "dispatcher: not running"
-  fi
+  who_dispatcher "$operator"
   # An agent polling for its own reply cannot receive it mid-turn; say so where it is looking.
   if [ -n "${PPI_ALIAS:-}" ] && queued "$PPI_ALIAS"; then
     echo "ppi: messages queued for $PPI_ALIAS (you) arrive only after you stop; finish your response now instead of waiting."
@@ -745,17 +743,24 @@ ppi operator console
   /quit
 EOF
   # Sends to the operator only reach the bus log. Follow it here, with every batch that turns
-  # uncertain; each line ends by reprinting the prompt it interrupted, which keeps readline's
-  # cursor column intact.
-  # A closed pane kills this process without running traps, so the follower watches
+  # uncertain and the dispatcher's health; each line ends by reprinting the prompt it interrupted,
+  # which keeps readline's cursor column intact.
+  # A closed pane kills this process without running traps, so the watch follows
   # the console pid and stops tail itself.
   ( tail -n 0 -F "$PPI_HOME/bus.jsonl" 2>/dev/null & follower=$!
-    while kill -0 "$$" 2>/dev/null; do sleep 1; done
+    watch_dispatcher "$$"
     kill "$follower" 2>/dev/null || true ) </dev/null \
     | jq -R --unbuffered -j "$JQ_LIB"' fromjson?
         | if .to == "operator" then "\n[ppi from=\(.from) to=operator id=\(.id)] \(.msg)\noperator> "
           elif .from == "ppi" and .status == "uncertain" then
             "\n[ppi] batch \(.batch) to \(.to) is uncertain: \(cause). Inspect \(.to), then /requeue \(.batch) to send it again or /dismiss \(.batch) to drop it.\noperator> "
+          elif .watch == "stopped" then
+            "\n[ppi] the dispatcher stopped: nothing is delivered until it runs again; /who says why and how to restart it.\noperator> "
+          elif .watch == "unresponsive" then
+            "\n[ppi] the dispatcher has not finished a pass in over 10 s; delivery may be stuck; /who shows more.\noperator> "
+          elif .watch == "running" then "\n[ppi] the dispatcher is running again.\noperator> "
+          elif .watch == "restart" then
+            "\n[ppi] the dispatcher restarted after exit status \(.status) (\(.count) in the last 60 s; it stops at 5 within a minute).\noperator> "
           else empty end' &
   local line to
   # Default IFS trims surrounding whitespace, so " @claude hi" still parses.
@@ -923,42 +928,147 @@ stop_reader() { # lock dir
   rm -f "$1/reader"
 }
 
+# Classify the dispatcher lock into OWNER_STATE: absent, incomplete (no complete owner record),
+# foreign (another Rex session, where its block looks missing), live, exited, gone, other (the
+# block runs another program), or unknown (Rex gave no usable answer, in OWNER_ERR). Only exited
+# and gone prove the owner over: a pid mismatch or an old heartbeat proves nothing.
+dispatcher_state() {
+  local d=$PPI_HOME/dispatcher.lock owner out rc=0
+  OWNER_STATE="" OWNER_PID="" OWNER_BLOCK="" OWNER_SESSION="" OWNER_ERR=""
+  if [ ! -d "$d" ]; then OWNER_STATE=absent; return; fi
+  owner=$(cat "$d/owner" 2>/dev/null) || owner=""
+  OWNER_PID=$(jq -r '.pid // ""' <<<"$owner" 2>/dev/null) || OWNER_PID=""
+  OWNER_BLOCK=$(jq -r '.block // ""' <<<"$owner" 2>/dev/null) || OWNER_BLOCK=""
+  OWNER_SESSION=$(jq -r '.session // ""' <<<"$owner" 2>/dev/null) || OWNER_SESSION=""
+  case $OWNER_PID in "" | *[!0-9]*) OWNER_STATE=incomplete; return ;; esac
+  if [ -z "$OWNER_BLOCK" ] || [ -z "$OWNER_SESSION" ]; then OWNER_STATE=incomplete; return; fi
+  if [ "$OWNER_SESSION" != "$REX_SESSION" ]; then OWNER_STATE=foreign; return; fi
+  # The API, not block call: the CLI exits 3 for a malformed id too, and only a confirmed not_found
+  # proves the block gone, the rule the dispatcher's own reads follow.
+  out=$(jq -cn --arg b "$OWNER_BLOCK" '{block_id: $b, args: {}}' \
+    | rx api call -s "$REX_SESSION" com.superlogical.terminal.process - 2>&1) || rc=$?
+  case $rc in
+    0) OWNER_STATE=$(jq -r --argjson pid "$OWNER_PID" \
+         'if .last_exit != null then "exited" elif .child.pid == $pid then "live" else "other" end' <<<"$out" 2>/dev/null) \
+         || OWNER_STATE="" ;;
+    3) case $out in *"code=not_found"*) OWNER_STATE=gone ;; esac ;;
+  esac
+  if [ -z "$OWNER_STATE" ]; then OWNER_STATE=unknown OWNER_ERR=${out:-no answer}; fi
+}
+
+# A pass touches the heartbeat; a new owner has had no pass yet, so its claim time counts as one.
+# The records may be anything a crash or a hand edit left, so each field is read only as its type.
+STALE_PASS=10
+DISPATCH_HEALTH='
+def last_pass($beat; $owner): [$beat, (($owner.hr | numbers) // 0)] | max | if . > 0 then now - . else null end;
+def times($r; $owner):
+  if ($r.owner | type) == "number" and $r.owner == $owner.pid then [(($r.times | arrays) // [])[] | numbers] else [] end;
+def recent($r; $owner): [times($r; $owner)[] | select(now - . < 60)];
+'
+# A record file's content when it is a JSON object, else nothing.
+record() { jq -c 'objects' "$1" 2>/dev/null || true; }
+
+# The dispatcher line of ppi who. A restart command follows, for the operator only, when the next
+# ppi dispatch would take the lock.
+who_dispatcher() { # operator
+  local d=$PPI_HOME/dispatcher.lock beat
+  dispatcher_state
+  beat=$(perl -e '@s = stat shift; print @s ? $s[9] : 0' "$PPI_HOME/heartbeat")
+  jq -rn --arg state "$OWNER_STATE" --arg pid "$OWNER_PID" --arg block "$OWNER_BLOCK" --arg session "$OWNER_SESSION" \
+    --arg err "$OWNER_ERR" --arg lock "$d" --argjson beat "$beat" --argjson stale "$STALE_PASS" \
+    --slurpfile owner <(record "$d/owner") --slurpfile restarts <(record "$d/restarts") \
+    --slurpfile last <(record "$PPI_HOME/dispatcher.last") "$JQ_LIB $DISPATCH_HEALTH"'
+    ($owner[0] // {}) as $o | last_pass($beat; $o) as $age
+    | (if $age == null then "no pass yet" else "last pass \($age | floor)s ago" end) as $pass
+    | recent($restarts[0] // {}; $o) as $recent
+    | (if ($recent | length) == 0 then ""
+       else "; \($recent | length) restart\(if ($recent | length) == 1 then "" else "s" end) in the last 60 s, the last after exit status \($restarts[0].status)" end) as $rs
+    | "dispatcher: " + (
+        if $state == "absent" then "not running"
+          + ($last[0] // null | if . == null then ""
+             else "; it stopped at \((.hr | numbers | strflocaltime("%H:%M:%S")) // "an unknown time") "
+               + (if .why == "restart-cap" then "after 5 restarts within 60 s, the last after exit status \(.status)"
+                  elif .why == "signal" then "on a signal"
+                  elif .why == "exit" then "when its script ended with exit status \(.status)"
+                  else "when its supervisor failed" end) end)
+        elif $state == "incomplete" then "unknown; the lock has no complete owner record (\($lock)); remove it if no dispatcher runs"
+        elif $state == "foreign" then "unknown; the lock belongs to Rex session \($session), which this pane cannot check"
+        elif $state == "other" then "unknown; the lock names pid \($pid) in \($block), which runs another program"
+        elif $state == "unknown" then "unknown; cannot check \($block) (\($err | flat)); \($pass)"
+        elif $state == "exited" then "stopped; its program in \($block) exited; the next ppi dispatch replaces this lock"
+        elif $state == "gone" then "stopped; its block \($block) is gone; the next ppi dispatch replaces this lock"
+        elif $age != null and $age <= $stale then "running in \($block); \($pass)\($rs)"
+        else "unresponsive in \($block); \($pass); health unknown, not stopped\($rs)" end)'
+  case $1:$OWNER_STATE in
+    true:absent | true:exited | true:gone) printf '  restart: %s\n' "$(restart_command)" ;;
+  esac
+}
+
+# The console's watch, until the console exits: one JSON notice line per change of state, and one
+# per restart its owner records. A restart is a newer latest restart time under the same owner, since
+# the count over the last minute stays level when one restart ages out as another enters. The first
+# reading waits out a dispatcher that ppi up has only just started, and is reported only if not running.
+watch_dispatcher() { # console pid
+  local seen="" owner="" latest=0 state pid newest status count
+  sleep 3
+  while kill -0 "$1" 2>/dev/null; do
+    IFS='|' read -r state pid newest status count < <(dispatcher_pulse) || state=""
+    if [ -n "$state" ]; then
+      if [ "$state" != "$seen" ] && { [ -n "$seen" ] || [ "$state" != running ]; }; then
+        jq -cn --arg s "$state" '{watch: $s}'
+      fi
+      if [ -n "$owner" ] && [ "$pid" = "$owner" ] && [ "$newest" -gt "$latest" ]; then
+        jq -cn --arg s "$status" --arg n "$count" '{watch: "restart", status: $s, count: $n}'
+      fi
+      seen=$state owner=$pid latest=$newest
+    fi
+    sleep 1
+  done
+}
+
+# Start a dispatcher in a new tab of this Rex session, as ppi up does.
+restart_command() {
+  local cmd
+  cmd=$(printf '%q ' "${REX_BIN_DIR:+$REX_BIN_DIR/}rex" --autostart=false --timeout 15s window new -s "$REX_SESSION" "ppi bus" \
+    --shell=none --keep-open --focus=false -- env "PPI_HOME=$PPI_HOME" "$SELF" dispatch)
+  printf '%s\n' "${cmd% }"
+}
+
+# One reading for the console's watch, from files alone, |-separated: state (stopped, running,
+# unresponsive), owner pid, the owner's latest recorded restart, its exit status, and restarts in the last 60 s.
+dispatcher_pulse() {
+  local d=$PPI_HOME/dispatcher.lock beat
+  if [ ! -d "$d" ]; then echo 'stopped||0||0'; return; fi
+  beat=$(perl -e '@s = stat shift; print @s ? $s[9] : 0' "$PPI_HOME/heartbeat")
+  jq -rn --argjson beat "$beat" --argjson stale "$STALE_PASS" \
+    --slurpfile owner <(record "$d/owner") --slurpfile restarts <(record "$d/restarts") "$DISPATCH_HEALTH"'
+    ($owner[0] // {}) as $o | ($restarts[0] // {}) as $r | last_pass($beat; $o) as $age
+    | [(if $age != null and $age <= $stale then "running" else "unresponsive" end), (($o.pid | numbers) // ""),
+       (times($r; $o) | max // 0 | floor), (($r.status | numbers) // ""), (recent($r; $o) | length)]
+    | map(tostring) | join("|")'
+}
+
 # Take the dispatcher lock, replacing an owner whose block is gone or whose program has exited.
-# Anything less certain refuses and leaves the lock: a pid mismatch or an old heartbeat proves nothing,
-# and an owner in another Rex session cannot be checked from this one, where its block looks missing.
+# Anything less certain refuses and leaves the lock.
 # .dispatch serializes this with every owner's cleanup, so a cleanup never removes its replacement.
 claim_dispatcher() {
-  local d=$PPI_HOME/dispatcher.lock owner opid oblock osession out rc=0 state
+  local d=$PPI_HOME/dispatcher.lock
   lock .dispatch
   if ! mkdir "$d" 2>/dev/null; then
-    owner=$(cat "$d/owner" 2>/dev/null) || owner=""
-    opid=$(jq -r '.pid // ""' <<<"$owner" 2>/dev/null) || opid=""
-    oblock=$(jq -r '.block // ""' <<<"$owner" 2>/dev/null) || oblock=""
-    osession=$(jq -r '.session // ""' <<<"$owner" 2>/dev/null) || osession=""
-    case $opid in "" | *[!0-9]*) die "the dispatcher lock has no complete owner record: $d (remove it if no dispatcher runs)" ;; esac
-    [ -n "$oblock" ] && [ -n "$osession" ] || die "the dispatcher lock has no complete owner record: $d (remove it if no dispatcher runs)"
-    [ "$osession" = "$REX_SESSION" ] \
-      || die "the dispatcher lock belongs to Rex session $osession, where this pane cannot check it; the lock stays"
-    # The API, not block call: the CLI exits 3 for a malformed id too, and only a confirmed not_found
-    # proves the block gone, the rule the dispatcher's own reads follow.
-    out=$(jq -cn --arg b "$oblock" '{block_id: $b, args: {}}' \
-      | rx api call -s "$REX_SESSION" com.superlogical.terminal.process - 2>&1) || rc=$?
-    case $rc in
-      0) state=$(jq -r --argjson pid "$opid" \
-           'if .last_exit != null then "exited" elif .child.pid == $pid then "live" else "other" end' <<<"$out" 2>/dev/null) || state="" ;;
-      3) case $out in *"code=not_found"*) state=gone ;; *) state="" ;; esac ;;
-      *) state="" ;;
-    esac
-    case $state in
-      live) die "a dispatcher is already running in $oblock" ;;
+    dispatcher_state
+    case $OWNER_STATE in
+      absent) mkdir "$d" ;;
+      incomplete) die "the dispatcher lock has no complete owner record: $d (remove it if no dispatcher runs)" ;;
+      foreign) die "the dispatcher lock belongs to Rex session $OWNER_SESSION, where this pane cannot check it; the lock stays" ;;
+      live) die "a dispatcher is already running in $OWNER_BLOCK" ;;
       gone | exited)
         stop_reader "$d"
         rm -rf "$d"
         mkdir "$d"
-        echo "ppi: replacing the dispatcher of $oblock (its $([ "$state" = gone ] && echo block is gone || echo program exited))"
+        echo "ppi: replacing the dispatcher of $OWNER_BLOCK (its $([ "$OWNER_STATE" = gone ] && echo block is gone || echo program exited))"
         ;;
-      other) die "the dispatcher lock names pid $opid in $oblock, which runs another program; the lock stays" ;;
-      *) die "cannot check the dispatcher in $oblock (${out:-no answer}); the lock stays" ;;
+      other) die "the dispatcher lock names pid $OWNER_PID in $OWNER_BLOCK, which runs another program; the lock stays" ;;
+      *) die "cannot check the dispatcher in $OWNER_BLOCK ($OWNER_ERR); the lock stays" ;;
     esac
   fi
   jq -cn --argjson pid "$$" --arg block "$REX_BLOCK" --arg session "$REX_SESSION" \
@@ -979,6 +1089,9 @@ release_dispatcher() {
     wait "$DISPATCH_CHILD" 2>/dev/null || true
   fi
   if lock_try .dispatch 5 && owns_dispatcher; then
+    # Written before the lock goes, so who never sees the lock gone with an older stop beside it.
+    jq -cn --arg why "${DISPATCH_WHY:-error}" --arg status "${DISPATCH_RC:-}" \
+      '{why: $why, status: ($status | tonumber? // null), hr: now}' | put "$PPI_HOME/dispatcher.last" || true
     stop_reader "$PPI_HOME/dispatcher.lock"
     rm -rf "$PPI_HOME/dispatcher.lock"
   fi
@@ -999,8 +1112,9 @@ cmd_dispatch() {
   [ "$(jq -r '.child.pid // ""' <<<"$proc")" = "$$" ] \
     || die "ppi dispatch must be its pane's own program, not a command run from the pane's shell"
   claim_dispatcher
-  DISPATCH_STOP=0 DISPATCH_CHILD=""
-  trap 'DISPATCH_STOP=1; [ -z "$DISPATCH_CHILD" ] || kill -TERM "$DISPATCH_CHILD" 2>/dev/null || true' TERM INT HUP
+  DISPATCH_STOP=0 DISPATCH_CHILD="" DISPATCH_WHY="" DISPATCH_RC=""
+  # The reason is set here: a signal during the restart backoff ends the supervisor through errexit.
+  trap 'DISPATCH_STOP=1 DISPATCH_WHY=signal; [ -z "$DISPATCH_CHILD" ] || kill -TERM "$DISPATCH_CHILD" 2>/dev/null || true' TERM INT HUP
   trap release_dispatcher EXIT
   echo "ppi dispatcher: bus $PPI_HOME; Ctrl-C stops it"
   while [ "$DISPATCH_STOP" -eq 0 ]; do
@@ -1015,7 +1129,7 @@ cmd_dispatch() {
       rc=0
       wait "$DISPATCH_CHILD" || rc=$?
     done
-    DISPATCH_CHILD=""
+    DISPATCH_CHILD="" DISPATCH_RC=$rc
     [ "$DISPATCH_STOP" -eq 0 ] && [ "$rc" -ne 0 ] || break
     stop_own_reader
     now=$(date +%s) kept="" n=0
@@ -1023,13 +1137,18 @@ cmd_dispatch() {
       if [ $((now - t)) -lt 60 ]; then kept="$kept $t" n=$((n + 1)); fi
     done
     if [ "$n" -ge 5 ]; then
+      DISPATCH_WHY=restart-cap
       echo "ppi: the dispatcher failed (status $rc) after 5 restarts within a minute; stopped" >&2
       exit 1
     fi
     recent="$kept $now"
+    jq -cn --argjson owner "$$" --arg times "$recent" --argjson status "$rc" \
+      '{owner: $owner, times: ($times | split(" ") | map(select(. != "") | tonumber)), status: $status}' \
+      | put "$PPI_HOME/dispatcher.lock/restarts" || true
     echo "ppi: the dispatcher exited with status $rc; restarting in 1 s" >&2
     sleep 1
   done
+  if [ "$DISPATCH_STOP" -eq 1 ]; then DISPATCH_WHY=signal; else DISPATCH_WHY="exit"; fi
 }
 
 # The agents go side by side above this pane, the dispatcher gets its own tab, and this pane

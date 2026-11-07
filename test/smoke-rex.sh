@@ -741,6 +741,10 @@ check "who does not claim the unrelated prompt came before the observed batch" g
 check "the uncertain transition's bus line carries its reason" quiet_jq -se --argjson b "$BC" \
   'any(.[]; .batch == $b and .status == "uncertain" and .reason == "interrupted" and .detail == null)' "$SYN/bus.jsonl"
 check "who reports the dispatcher" grep -qx "dispatcher: not running" <<<"$who_out"
+jq -cn '{why: "restart-cap", status: 1, hr: now}' > "$SYN/dispatcher.last"
+check "who reports a dispatcher stopped at its restart cap" grep -qE \
+  "^dispatcher: not running; it stopped at [0-9:]{8} after 5 restarts within 60 s, the last after exit status 1$" <<<"$(syn "$PPI" who)"
+rm "$SYN/dispatcher.last"
 
 # Session scoping of failure holds.
 shook sb session-start '{"session_id":"B1","source":"startup"}' >/dev/null
@@ -975,6 +979,24 @@ pane nested --keep-open -- env PPI_HOME="$DH" bash -c '"$0" dispatch > "$1/neste
 check "a dispatcher started from a pane's shell is refused" eventually grep -qsx 1 "$TMP/nested.rc"
 check "the refusal says it must be the pane's own program" grep -q "own program" "$TMP/nested.out"
 check "a refused dispatcher leaves no lock" [ ! -e "$DH/dispatcher.lock" ]
+who_out=$(dppi who)
+check "who reports no dispatcher" grep -qx "dispatcher: not running" <<<"$who_out"
+check "and gives the operator the command that starts one for this session and bus" grep -qF -- \
+  "window new -s $REX_SESSION ppi\\ bus --shell=none --keep-open --focus=false -- env PPI_HOME=$DH $PPI dispatch" <<<"$who_out"
+check "an agent's who leaves the restart command out" fails_with grep -q "restart:" <<<"$(env PPI_HOME="$DH" PPI_ALIAS=zz "$PPI" who)"
+mkdir "$DH/dispatcher.lock"
+who_out=$(dppi who)
+check "who reports a lock with no complete owner record as unknown" grep -qxF \
+  "dispatcher: unknown; the lock has no complete owner record ($DH/dispatcher.lock); remove it if no dispatcher runs" <<<"$who_out"
+check "and offers no restart command for it" fails_with grep -q "restart:" <<<"$who_out"
+for bad in '{' '"x"'; do
+  printf '%s\n' "$bad" > "$DH/dispatcher.lock/owner"
+  who_out=$(dppi who 2>&1) || true
+  check "who reports an owner record of $bad as incomplete, not as an error" grep -qxF \
+    "dispatcher: unknown; the lock has no complete owner record ($DH/dispatcher.lock); remove it if no dispatcher runs" <<<"$who_out"
+  check "and offers no restart command for it ($bad)" fails_with grep -q "restart:" <<<"$who_out"
+done
+rm -rf "$DH/dispatcher.lock"
 
 CLOSED=$(pane zg -- true)
 check "a closed block is gone from Rex (precondition)" eventually block_closed "$CLOSED"
@@ -996,6 +1018,7 @@ refused_owner() { # name block
   mkdir "$DH/dispatcher.lock"
   jq -cn --arg b "$2" --arg s "$SMOKE_SESSION" '{pid: 1, block: $b, session: $s, hr: 0}' > "$DH/dispatcher.lock/owner"
   cp "$DH/dispatcher.lock/owner" "$TMP/owner-before"
+  REFUSED_WHO=$(dppi who | grep '^dispatcher:')
   REFUSED=$(dispatcher_pane "$1")
   eventually exited_with "$REFUSED" 1 && cmp -s "$TMP/owner-before" "$DH/dispatcher.lock/owner" || rc=1
   # A dispatcher that wrongly took over would keep running; stop it before the lock goes.
@@ -1004,7 +1027,18 @@ refused_owner() { # name block
   return "$rc"
 }
 check "an owner record naming another program's pid is refused, the lock unchanged" refused_owner mismatch "$LIVE"
+check "who reports that owner as unknown, not replaceable" \
+  [ "$REFUSED_WHO" = "dispatcher: unknown; the lock names pid 1 in $LIVE, which runs another program" ]
 check "an owner block Rex rejects as malformed is not taken as gone, the lock unchanged" refused_owner malformed block:not-a-uuid
+check "who reports that owner as one it cannot check, with Rex's answer" \
+  grep -q '^dispatcher: unknown; cannot check block:not-a-uuid (.*code=bad_request' <<<"$REFUSED_WHO"
+mkdir "$DH/dispatcher.lock"
+jq -cn --arg b "$CLOSED" --arg s "$REX_SESSION" '{pid: 1, block: $b, session: $s, hr: 0}' > "$DH/dispatcher.lock/owner"
+who_out=$(dppi who)
+check "who reports a lock whose owner's block is gone as stopped and replaceable" grep -qx \
+  "dispatcher: stopped; its block $CLOSED is gone; the next ppi dispatch replaces this lock" <<<"$who_out"
+check "with the restart command" grep -q '^  restart: ' <<<"$who_out"
+rm -rf "$DH/dispatcher.lock"
 
 DISP1=$(dispatcher_pane bus1)
 check "the dispatcher owns the lock as its pane's own program" eventually owner_is "$DISP1"
@@ -1027,6 +1061,9 @@ OTHER=$("$REX" run -s "$OTHER_SESSION" --label other --focus=false --keep-open -
 other_refused() { "$REX" block call -s "$OTHER_SESSION" -b "$OTHER" process 2>/dev/null | jq -e '.last_exit.exit_code == 1' >/dev/null; }
 check "a dispatcher in another Rex session on the same bus is refused" eventually other_refused
 check "that refusal leaves the first owner in place" owner_is "$DISP1"
+check "who from the other session reports the owner as one it cannot check" grep -qxF \
+  "dispatcher: unknown; the lock belongs to Rex session $REX_SESSION, which this pane cannot check" \
+  <<<"$(env PPI_HOME="$DH" REX_SESSION="$OTHER_SESSION" "$PPI" who)"
 
 SI=$(pane si --keep-open -- env PPI_HOME="$DH" "$PPI" run --runtime fake si "$STANDIN")
 check "the stand-in harness starts" eventually test -e "$DH/standin.si.ready"
@@ -1116,31 +1153,76 @@ sleep 1.5
 check "input queued for it is held as no-identity" grep -q "^sx .*hold=no-identity" <<<"$(dppi who)"
 check "the held input stays queued" queued_count sx 1
 
-check "who reports the dispatcher's block and heartbeat" grep -qE "^dispatcher: block=$DISP1 heartbeat=[0-2]s ago$" <<<"$(dppi who)"
+check "who reports the dispatcher running, with its last pass" grep -qE "^dispatcher: running in $DISP1; last pass [0-2]s ago$" <<<"$(dppi who)"
+# An operator console on this bus follows the dispatcher's health from here to its stop.
+mkfifo "$TMP/hconsole.in"
+env PPI_HOME="$DH" "$PPI" console <"$TMP/hconsole.in" >"$TMP/hconsole.out" 2>&1 &
+hconsole_pid=$!
+exec 8>"$TMP/hconsole.in"
 lines=$(wc -l < "$DH/bus.jsonl")
 sleep 3
 check "an idle bus with a running dispatcher logs nothing" [ "$(wc -l < "$DH/bus.jsonl")" -eq "$lines" ]
+sleep 1.5
+check "the console says nothing about a running dispatcher" fails_with grep -q '\[ppi\] the dispatcher' "$TMP/hconsole.out"
 
+# A restart recorded 30 s ago stands in for one about to age out of the window: the next restart
+# replaces it, so the count over the last minute stays at one while a new restart is recorded.
+jq -cn --argjson o "$(owner_pid)" '{owner: $o, times: [(now - 30 | floor)], status: 1}' > "$DH/dispatcher.lock/restarts"
+sleep 1.5
 R1=$(reader_pid)
 kill -9 "$(pgrep -P "$(owner_pid)" | head -n 1)"
 restarted() { local r; r=$(reader_pid) && [ -n "$r" ] && [ "$r" != "$R1" ] && reader_alive && owner_is "$DISP1"; }
 check "a killed dispatcher script is restarted under the same owner" eventually restarted
 check "the killed script's orphaned reader is stopped" eventually gone_pid "$R1"
+check "the console reports the restart, though the count stayed at one" eventually_in "$TMP/hconsole.out" \
+  '^\[ppi\] the dispatcher restarted after exit status 137 (1 in the last 60 s; it stops at 5 within a minute)\.$'
+check "who counts the restart and gives its exit status" grep -qE \
+  "^dispatcher: running in $DISP1; last pass [0-9]+s ago; 1 restart in the last 60 s, the last after exit status 137$" <<<"$(dppi who)"
+
+# A script that stops passing while its owner lives is unresponsive, not stopped.
+SCRIPT1=$(pgrep -P "$(owner_pid)" | head -n 1)
+kill -STOP "$SCRIPT1"
+perl -e 'utime time - 60, time - 60, shift' "$DH/heartbeat"
+check "who reports a live owner with no recent pass as unresponsive" grep -qE \
+  "^dispatcher: unresponsive in $DISP1; last pass [0-9]+s ago; health unknown, not stopped; 1 restart in the last 60 s, the last after exit status 137$" \
+  <<<"$(dppi who)"
+check "the console reports it" eventually_in "$TMP/hconsole.out" \
+  '^\[ppi\] the dispatcher has not finished a pass in over 10 s; delivery may be stuck; /who shows more\.$'
+kill -CONT "$SCRIPT1"
+check "the console reports the recovery" eventually_in "$TMP/hconsole.out" '^\[ppi\] the dispatcher is running again\.$'
 
 R2=$(reader_pid)
 "$REX" send-key -s "$SMOKE_SESSION" -b "$DISP1" ctrl+c
 check "Ctrl-C in the dispatcher pane ends it" eventually exited_but_open "$DISP1"
 check "Ctrl-C leaves no dispatcher lock" [ ! -e "$DH/dispatcher.lock" ]
 check "Ctrl-C leaves no reader" eventually gone_pid "$R2"
+check "the console reports the dispatcher stopped" eventually_in "$TMP/hconsole.out" \
+  '^\[ppi\] the dispatcher stopped: nothing is delivered until it runs again; /who says why and how to restart it\.$'
+echo /quit >&8
+exec 8>&-
+wait "$hconsole_pid" || true
+who_out=$(dppi who)
+check "who reports when and why the dispatcher stopped" grep -qE "^dispatcher: not running; it stopped at [0-9:]{8} on a signal$" <<<"$who_out"
+# A console that starts while no dispatcher runs says so once its first reading is in.
+env PPI_HOME="$DH" "$PPI" console < <(sleep 4.5; echo /quit) >"$TMP/lconsole.out" 2>&1
+check "a console started while the dispatcher is down reports it" grep -q \
+  '^\[ppi\] the dispatcher stopped: nothing is delivered until it runs again; /who says why and how to restart it\.$' "$TMP/lconsole.out"
 
-DISP3=$(dispatcher_pane bus3)
-eventually owner_is "$DISP3" || true
+# The successor starts with the restart command who printed.
+bash -c "$(sed -n 's/^  restart: //p' <<<"$who_out")" >/dev/null
+new_owner() { local b; b=$(jq -r '.block // ""' "$DH/dispatcher.lock/owner" 2>/dev/null) && [ -n "$b" ] && owner_is "$b"; }
+check "the restart command who printed starts a dispatcher that owns the lock" eventually new_owner
+DISP3=$(jq -r '.block // ""' "$DH/dispatcher.lock/owner" 2>/dev/null || true)
 R3=$(reader_pid)
 SUP3=$(owner_pid)
 SCRIPT3=$(pgrep -P "$SUP3" | head -n 1)
 kill -9 "$SUP3"
 check "the killed supervisor's program has exited, its block open (precondition)" eventually exited_but_open "$DISP3"
 check "a supervisor killed outright leaves its lock (precondition)" [ "$(owner_pid)" = "$SUP3" ]
+who_out=$(dppi who)
+check "who reports a lock whose owner's program exited as stopped and replaceable" grep -qx \
+  "dispatcher: stopped; its program in $DISP3 exited; the next ppi dispatch replaces this lock" <<<"$who_out"
+check "with the restart command" grep -q '^  restart: ' <<<"$who_out"
 check "the killed supervisor's script does not outlive it" eventually gone_pid "$SCRIPT3"
 DISP4=$(dispatcher_pane bus4)
 check "the next dispatcher replaces an owner whose program exited" eventually owner_is "$DISP4"
@@ -1167,8 +1249,8 @@ check "the closed owner's reader is stopped" eventually gone_pid "$R4"
 # A tick that fails after writing its reservation: the script ends, and the restart holds the attempt.
 # Closing the old owner above can kill a ppi call that holds a lock, which then fails every restart.
 no_locks() { [ -z "$(ls -A "$DH/locks")" ]; }
-check "the closed owner left no lock behind (precondition)" eventually no_locks
-no_locks || echo "  left in $DH/locks: $(ls -A "$DH/locks" | tr '\n' ' ')"
+locks_cleared() { eventually no_locks || { echo "  left in $DH/locks: $(ls -A "$DH/locks" | tr '\n' ' ')"; return 1; }; }
+check "the closed owner left no lock behind (precondition)" locks_cleared
 SR=$(pane sr --keep-open -- env PPI_HOME="$DH" "$PPI" run --runtime fake sr "$STANDIN")
 check "the stand-in is at its prompt (precondition)" eventually test -e "$DH/standin.sr.ready"
 dsend sr "into a failed reservation"
@@ -1232,6 +1314,7 @@ esac
 exec $(command -v jq) "\$@"
 EOF
 chmod +x "$TMP/failjq/jq"
+check "the stopped dispatcher left no lock behind (precondition)" locks_cleared
 SL=$(pane sl --keep-open -- env PPI_HOME="$DH" "$PPI" run --runtime fake sl "$STANDIN")
 check "a fresh stand-in is at its prompt (precondition)" eventually test -e "$DH/standin.sl.ready"
 type_into "$SL" hello
@@ -1250,7 +1333,14 @@ check "who renders the dispatcher's error in the cause" grep -qxF \
   "  batch $BL: a queue operation failed during delivery ($injected); /requeue $BL or /dismiss $BL" <<<"$(dppi who)"
 check "nothing went out after the failed check" quiet_jq -se --argjson b "$BL" \
   'all(.[]; .batch != $b or .status != "submitted")' "$DH/bus.jsonl"
-kill -TERM "$(owner_pid)"
-eventually exited_but_open "$DISP7" || true
+
+# Ctrl-C during the restart backoff ends the supervisor through errexit; the stop is still a signal.
+SUP7=$(owner_pid)
+kill -9 "$(pgrep -P "$SUP7" | head -n 1)"
+in_backoff() { pgrep -P "$SUP7" -x sleep >/dev/null; }
+check "the supervisor waits out its restart backoff (precondition)" eventually in_backoff
+"$REX" send-key -s "$SMOKE_SESSION" -b "$DISP7" ctrl+c
+check "Ctrl-C during the backoff ends the dispatcher" eventually exited_but_open "$DISP7"
+check "and who records the stop as a signal" grep -qE "^dispatcher: not running; it stopped at [0-9:]{8} on a signal$" <<<"$(dppi who)"
 
 if [ "$fails" -eq 0 ]; then echo "all passed"; else echo "$fails failed"; exit 1; fi
