@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ppi: ping pong interactive, a message bus between agents running in Zellij or Rex panes.
+# ppi: ping pong interactive, a message bus between agents running in Rex panes.
 #
 #   ppi run [--runtime <name>] <alias> <command> [args...]
 #                                         register this pane as <alias>, then exec the agent
@@ -9,8 +9,7 @@
 #   ppi who                               list participants, panes, and states
 #   ppi monitor                           follow the bus log; delivers messages left pending
 #   ppi console                           operator prompt: @<alias> <message>
-#   ppi layout [config]                   print the Zellij layout for an arms config
-#   ppi up [config]                       launch Zellij with that layout; in a Rex pane, build it around the pane
+#   ppi up [config]                       build the workspace for an arms config around this pane
 #   ppi hook <session-start|prompt|stop|idle>   agent hook entry points
 set -euo pipefail
 
@@ -29,25 +28,17 @@ valid_name() { # what value
   case $2 in "" | *[!a-z0-9_-]*) die "invalid $1 '$2' (use a-z 0-9 _ -)" ;; esac
 }
 
-# Zellij inside a Rex terminal inherits REX_*, so the innermost multiplexer, Zellij, wins.
 init_home() {
   local key
-  if [ -n "${ZELLIJ_SESSION_NAME:-}" ]; then
-    MUX=zellij key=$ZELLIJ_SESSION_NAME
-  elif [ -n "${REX_SESSION:-}" ]; then
-    # The ID, not the label: a session can be renamed while the bus runs.
-    key=${REX_SESSION#session:}
-    case $key in "" | *[!0-9a-f-]*) die "invalid REX_SESSION '$REX_SESSION'" ;; esac
-    MUX=rex key=rex-$key
-  else
-    die "not inside a Zellij session or a Rex terminal (ZELLIJ_SESSION_NAME and REX_SESSION unset)"
-  fi
-  PPI_HOME=${PPI_HOME:-/tmp/ppi-$(id -u)/$key}
+  [ -n "${REX_SESSION:-}" ] || die "not inside a Rex terminal (REX_SESSION unset)"
+  # The ID, not the label: a session can be renamed while the bus runs.
+  key=${REX_SESSION#session:}
+  case $key in "" | *[!0-9a-f-]*) die "invalid REX_SESSION '$REX_SESSION'" ;; esac
+  PPI_HOME=${PPI_HOME:-/tmp/ppi-$(id -u)/rex-$key}
   mkdir -p "$PPI_HOME/panes" "$PPI_HOME/state" "$PPI_HOME/queue"
   touch "$PPI_HOME/bus.jsonl"
 }
 
-zj() { zellij --session "$ZELLIJ_SESSION_NAME" "$@"; }
 # A sender that cannot reach the server (a sandboxed agent) must not start one,
 # and a stuck call must end inside the 10-second hook budget.
 rx() { "${REX_BIN_DIR:+$REX_BIN_DIR/}rex" --autostart=false --timeout 3s "$@"; }
@@ -96,21 +87,9 @@ known() { ls "$PPI_HOME/panes" | tr '\n' ' '; }
 check_pane() {
   local pane rc=0
   pane=$(cat "$PPI_HOME/panes/$1")
-  "${MUX}_alive" "$pane" || rc=$?
+  rex_alive "$pane" || rc=$?
   [ "$rc" -ne 1 ] || CHECK_ERR="$1's pane ($pane) is not running"
   return "$rc"
-}
-
-zellij_alive() {
-  local panes
-  # zellij can exit 0 on an unknown session (when several sessions run), so require actual JSON.
-  if ! panes=$(zj action list-panes --json 2>&1) || ! jq -e 'type == "array"' <<<"$panes" >/dev/null 2>&1; then
-    CHECK_ERR="cannot reach Zellij session '$ZELLIJ_SESSION_NAME' ($panes)"
-    return 2
-  fi
-  jq -e --argjson id "$1" \
-    'any(.[]; .id == $id and (.is_plugin | not) and (.exited | not) and ((.is_held // false) | not))' \
-    <<<"$panes" >/dev/null || return 1
 }
 
 # rex exits 3 for a block that no longer exists. Any other failure counts as unreachable,
@@ -130,13 +109,8 @@ rex_alive() {
   return 2
 }
 
-# Both send a bracketed paste when the program asks for one, so a multi-line delivery submits once.
-zellij_inject() {
-  zj action paste --pane-id "$1" "$2" >/dev/null || return 1
-  sleep "$SUBMIT_DELAY"
-  zj action write --pane-id "$1" 13 >/dev/null
-}
-# rex send types the text unbracketed; a paste event is what brackets it.
+# A paste event is bracketed when the program asks for one, so a multi-line delivery submits once.
+# rex send would type the text unbracketed.
 rex_inject() {
   jq -cn --arg block "$1" --arg text "$2" '{block_id: $block, event: {type: "paste", payload: {text: $text}}}' \
     | rx api call -s "$REX_SESSION" block.event - >/dev/null || return 1
@@ -161,7 +135,7 @@ drain() {
     check_pane "$alias" || return 1
     pane=$(cat "$PPI_HOME/panes/$alias")
     CHECK_ERR="typing into pane $pane failed"
-    "${MUX}_inject" "$pane" "$text" || return 1
+    rex_inject "$pane" "$text" || return 1
   else
     # Harnesses label a blocking Stop hook as an error; say what it is before the envelope.
     jq -cn --arg reason "ppi: message delivered at the end of your turn, not an error. Handle it as a new bus message.
@@ -182,17 +156,13 @@ cmd_run() {
     shift 2
   fi
   [ $# -ge 2 ] || die "$usage"
-  local alias=$1 pane_var
+  local alias=$1
   shift
   valid_name participant "$alias"
   [ "$alias" != operator ] || die "'operator' is reserved for the console"
   init_home
-  case $MUX in
-    zellij) pane_var=ZELLIJ_PANE_ID ;;
-    rex) pane_var=REX_BLOCK ;;
-  esac
-  [ -n "${!pane_var:-}" ] || die "$pane_var unset; run this inside a $MUX pane"
-  echo "${!pane_var}" > "$PPI_HOME/panes/$alias"
+  [ -n "${REX_BLOCK:-}" ] || die "REX_BLOCK unset; run this inside a Rex pane"
+  echo "$REX_BLOCK" > "$PPI_HOME/panes/$alias"
   # Undeliverable until the agent is at its prompt; a SessionStart hook or /release marks it idle.
   set_state "$alias" starting
   : > "$PPI_HOME/queue/$alias"
@@ -245,7 +215,7 @@ cmd_send() {
     >> "$PPI_HOME/queue/$to"
   if [ "$rc" -eq 2 ]; then
     log "$from" "$to" pending "$msg" "$id"
-    echo "ppi: queued for $to; the ppi monitor will deliver it (this process cannot reach $MUX)"
+    echo "ppi: queued for $to; the ppi monitor will deliver it (this process cannot reach Rex)"
   elif [ "$(state_of "$to")" = idle ]; then
     drain "$to" inject || die "not delivered, left queued: $CHECK_ERR"
     echo "ppi: delivered to $to"
@@ -449,17 +419,6 @@ read_config() {
   done <<<"$(jq -c '.[]' <<<"$arms")"
 }
 
-kdl_str() {
-  local s=${1//\\/\\\\}
-  printf '"%s"' "${s//\"/\\\"}"
-}
-
-kdl_args() {
-  local out="" a
-  for a in "$@"; do out="$out $(kdl_str "$a")"; done
-  printf '%s' "${out# }"
-}
-
 # The pane's argv for one arm: ppi run, then the preset's command line or the arm's own.
 arm_argv() {
   local arm=$1 name runtime model profile a
@@ -489,76 +448,6 @@ arm_argv() {
   esac
 }
 
-cmd_layout() {
-  [ $# -le 1 ] || die "usage: ppi layout [config]"
-  local file arms arm name
-  local -a argv
-  file=$(config_path "${1:-}")
-  arms=$(read_config "$file")
-  cat <<EOF
-layout {
-    // A tab opened later, such as with +, otherwise opens bare: one pane, no tab bar or status bar
-    new_tab_template {
-        pane size=1 borderless=true {
-            plugin location="zellij:tab-bar"
-        }
-        pane
-        pane size=2 borderless=true {
-            plugin location="zellij:status-bar"
-        }
-    }
-
-    // Floating panes start hidden; toggle them with Alt f
-    tab hide_floating_panes=true {
-        pane size=1 borderless=true {
-            plugin location="zellij:tab-bar"
-        }
-
-        // Agents side by side, each registered on the bus under its arm name
-        pane split_direction="vertical" {
-EOF
-  while IFS= read -r arm; do
-    name=$(jq -r '.name' <<<"$arm")
-    arm_argv "$arm"
-    printf '            pane name=%s command=%s {\n' "$(kdl_str "$name")" "$(kdl_str "$SELF")"
-    printf '                args %s\n' "$(kdl_args "${argv[@]}")"
-    printf '            }\n'
-  done <<<"$arms"
-  cat <<EOF
-        }
-
-        // Operator console, full width below the agents
-        pane size=10 name="operator" focus=true command=$(kdl_str "$SELF") {
-            args "console"
-        }
-
-        pane size=2 borderless=true {
-            plugin location="zellij:status-bar"
-        }
-
-        // Bus log; it also delivers pending messages, so hide it rather than close it
-        floating_panes {
-            pane name="ppi bus" x="10%" y="10%" width="80%" height="70%" command=$(kdl_str "$SELF") {
-                args "monitor"
-            }
-        }
-    }
-}
-EOF
-}
-
-cmd_up() {
-  # Same precedence as init_home: inside Zellij, even a Zellij within Rex, up launches Zellij.
-  if [ -z "${ZELLIJ_SESSION_NAME:-}" ] && [ -n "${REX_SESSION:-}" ]; then
-    rex_up "$@"
-    return
-  fi
-  local dir
-  dir=$(mktemp -d "${TMPDIR:-/tmp}/ppi-up.XXXXXX")
-  cmd_layout "$@" > "$dir/ppi.kdl"
-  exec zellij --layout "$dir/ppi.kdl"
-}
-
 # jq reads options even after --args, so an agent's own -c or -s would be taken as jq's.
 json_array() {
   local out='[]' a
@@ -568,7 +457,7 @@ json_array() {
 
 # The agents go side by side above this pane, the bus monitor gets its own tab, and this pane
 # runs the console. /quit returns to the shell; the agents keep running, and ppi console rejoins.
-rex_up() {
+cmd_up() {
   [ $# -le 1 ] || die "usage: ppi up [config]"
   local file arms arm f e agents="" layout path
   [ -n "${REX_BLOCK:-}" ] || die "REX_BLOCK unset; run ppi up inside a Rex pane"
@@ -667,11 +556,10 @@ case $cmd in
   who) cmd_who ;;
   monitor) cmd_monitor ;;
   console) cmd_console ;;
-  layout) cmd_layout "$@" ;;
   up) cmd_up "$@" ;;
   hook) cmd_hook "$@" ;;
   *)
-    sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 1
     ;;
 esac

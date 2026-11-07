@@ -8,7 +8,7 @@
     {
       "name": "ppi",
       "source": "./plugins/claude/ppi",
-      "description": "Hooks that let the ppi Zellij message bus deliver to Claude Code only at its prompt."
+      "description": "Hooks that let the ppi Rex message bus deliver to Claude Code only at its prompt."
     }
   ]
 }
