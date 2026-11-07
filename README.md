@@ -1,6 +1,6 @@
 # ppi — Ping Pong Interactive
 
-**A zero-daemon local message bus for orchestrating CLI coding agents (Claude Code, OpenAI Codex) and a human operator in Zellij.**
+**A zero-daemon local message bus for orchestrating CLI coding agents (Claude Code, OpenAI Codex) and a human operator in Zellij or Rex.**
 
 `ppi` turns Zellij panes into a multi-agent workspace: AI coding agents collaborate side-by-side with human-in-the-loop oversight, all in one Bash script.
 
@@ -9,7 +9,7 @@
 - **Built-in loop guard:** Caps agent-to-agent traffic at 20 messages until the human operator sends again. Over-limit sends are refused and logged as `blocked`; messages to the operator always pass.
 - **Prompt-injection aware:** The injected contract tells each agent that a message from another agent is a request, never the user's approval: it cannot approve a permission prompt or authorize new work.
 
-**Requirements:** Zellij `0.44+`, `jq`, and Bash `3.2+`. Runs on macOS, Linux, and Windows via WSL2.
+**Requirements:** Zellij `0.44+`, `jq`, and Bash `3.2+`. Runs on macOS, Linux, and Windows via WSL2. On macOS, [Rex](https://www.superlogical.com/rex/docs) works in place of Zellij.
 
 ## Install
 
@@ -72,6 +72,8 @@ ppi up custom.json     # or pass an explicit config file
 
 The panes start in the directory `ppi up` runs from, so that directory is the agents' workspace.
 
+Inside a Rex pane, `ppi up` builds the workspace around that pane instead of starting Zellij: the agents open side by side above it, the pane becomes the operator console, and the bus monitor runs in a **ppi bus** tab. `/quit` returns you to your shell while the agents keep running; `ppi console` rejoins them. A Rex session holds one workspace at a time.
+
 ### Orchestrate from the Operator Console
 
 `ppi up` opens your agents side-by-side on top and focuses the **Operator Console** across the bottom:
@@ -105,7 +107,7 @@ Models are not checked: a wrong model fails inside its pane after Zellij starts,
 ## CLI Reference
 
 ```text
-ppi up [config]                            launch Zellij with the generated layout
+ppi up [config]                            launch Zellij with the generated layout; in a Rex pane, build it around the pane
 ppi layout [config]                        print the Zellij KDL layout without launching
 ppi console                                start the interactive operator prompt
 ppi monitor                                tail bus.jsonl and deliver pending sandboxed messages
@@ -124,7 +126,7 @@ ppi hook <session-start|prompt|stop|idle>  lifecycle hook entry points
    - If a recipient is `idle`, `ppi send` pastes `[ppi from=<sender> to=<recipient> id=<id>] <msg>` directly into its Zellij pane.
    - If a recipient is `busy`, the message queues on disk. When the recipient finishes its turn, its `Stop` hook blocks exit and feeds the queued messages back as the next prompt.
    - Claude only: the `idle_prompt` notification marks the agent `idle` and delivers its queue, which recovers an agent left `busy` by an interrupted turn.
-3. **Sandboxed Delivery (Codex):** Codex panes run in `workspace-write` mode without access to the Zellij socket. When Codex runs `ppi send`, the message is logged as `pending`, and the unsandboxed `ppi monitor` floating pane (`Alt f`) delivers it into the target pane.
+3. **Sandboxed Delivery (Codex):** Codex panes run in `workspace-write` mode without access to the Zellij or Rex socket. When Codex runs `ppi send`, the message is logged as `pending`, and the unsandboxed `ppi monitor` (the floating pane under Zellij, the **ppi bus** tab under Rex) delivers it into the target pane.
 
 ## Development
 
@@ -136,4 +138,10 @@ Run the smoke test:
 
 ```sh
 /bin/bash /path/to/ppi/test/smoke.sh
+```
+
+The Rex smoke test opens and closes its own Rex session. Run it from a Rex pane, or set `REX_BIN_DIR` to the directory holding the `rex` CLI:
+
+```sh
+/bin/bash /path/to/ppi/test/smoke-rex.sh
 ```
