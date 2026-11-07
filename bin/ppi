@@ -446,6 +446,17 @@ cmd_layout() {
   arms=$(read_config "$file")
   cat <<EOF
 layout {
+    // A tab opened later, such as with +, otherwise opens bare: one pane, no tab bar or status bar
+    new_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        pane
+        pane size=2 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+
     // Floating panes start hidden; toggle them with Alt f
     tab hide_floating_panes=true {
         pane size=1 borderless=true {

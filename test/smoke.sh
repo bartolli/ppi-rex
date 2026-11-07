@@ -359,5 +359,10 @@ layout_loads() {
       and any($p[]; .title == "operator" and .pane_x == 0 and .pane_columns == $w)' "$TMP/panes.json" >/dev/null
 }
 check "Zellij loads it: arms side by side, operator full width, bus floating" layout_loads
+zellij -s "$S-layout" action dump-layout > "$TMP/dumped.kdl" 2>/dev/null || true
+new_tab_has() { awk '/^ *new_tab_template/ { p = 1 } p' "$TMP/dumped.kdl" | grep -q "$1"; }
+check "a tab opened later gets the tab bar" new_tab_has 'zellij:tab-bar'
+check "a tab opened later gets the status bar" new_tab_has 'zellij:status-bar'
+check "the agent tab still starts with the bus log hidden" grep -q 'tab name="Tab #1" hide_floating_panes=true' "$TMP/dumped.kdl"
 
 if [ "$fails" -eq 0 ]; then echo "all passed"; else echo "$fails failed"; exit 1; fi
