@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" SessionStart", "timeout": 10 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" UserPromptSubmit", "timeout": 30 }] }],
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" PreToolUse", "timeout": 10 }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" PermissionRequest", "timeout": 10 }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" PostToolUse", "timeout": 10 }] }],
+    "Notification": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" Notification", "timeout": 10 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" Stop", "timeout": 10 }] }],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" StopFailure", "timeout": 10 }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" PreCompact", "timeout": 10 }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "\"$PPI_PROBE_OBSERVE\" SessionEnd", "timeout": 10 }] }]
+  }
+}

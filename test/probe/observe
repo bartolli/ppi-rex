@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# ppi lifecycle probe: the hook side of the evidence. Records every hook input, decides
+# nothing, delivers nothing.
+#
+#   observe hook <session-start|prompt|stop|idle>   as PPI_BIN, called by the installed ppi plugin
+#   observe <HookEventName>                         from the probe's own hook settings
+#
+# Two prompt markers exercise competing hooks on UserPromptSubmit:
+#   PPI-PROBE-BLOCK   the prompt is blocked
+#   PPI-PROBE-SLOW    the check takes eight seconds (long enough to press Esc during it)
+set -u
+trace=${PPI_PROBE_TRACE:?PPI_PROBE_TRACE unset}
+event=${1:-}
+[ "$event" != hook ] || event="plugin:${2:-}"
+input=$(cat)
+
+now() { perl -MTime::HiRes=time -e 'printf "%.3f", time' 2>/dev/null || date +%s; }
+record() { # phase
+  jq -cn --arg alias "${PPI_ALIAS:-}" --arg event "$event" --arg phase "$1" --arg hr "$(now)" --arg pid "$$" \
+    --arg input "$input" \
+    '{src: "hook", hr: ($hr | tonumber), alias: $alias, event: $event, phase: $phase, pid: ($pid | tonumber),
+      input: ($input | fromjson? // {raw: $input})}' >> "$trace"
+}
+
+record begin
+prompt=$(jq -r '.prompt // ""' <<<"$input" 2>/dev/null || true)
+case $event in
+  UserPromptSubmit | plugin:prompt)
+    case $prompt in
+      *PPI-PROBE-SLOW*) sleep 8 ;;
+    esac
+    case $prompt in
+      *PPI-PROBE-BLOCK*) jq -cn '{decision: "block", reason: "ppi probe: blocked by a competing hook"}' ;;
+    esac
+    ;;
+esac
+record end
