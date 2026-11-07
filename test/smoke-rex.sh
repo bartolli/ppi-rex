@@ -118,6 +118,7 @@ HELD=$(pane held --keep-open -- env PPI_HOME="$PPI_HOME" "$PPI" run --runtime fa
 check "run registers the pane" wait_for "$PPI_HOME/panes/fake1"
 check "the registered pane is the agent's Rex block" [ "$(cat "$PPI_HOME/panes/fake1" 2>/dev/null)" = "$FAKE1" ]
 check "who shows a new agent unvalidated" eventually bash -c '"$1" who | grep -q "^fake1 block=$2 unvalidated "' _ "$PPI" "$FAKE1"
+check "who says when no harness session is recorded" bash -c '"$1" who | grep -q "^fake1 .* no harness session recorded$"' _ "$PPI"
 check "who shows an unused turn budget" turns_are 0
 env_exported() {
   wait_for "$PPI_HOME/fake1.env" &&
@@ -163,24 +164,28 @@ check "console exit stops its bus follower" eventually follower_gone
 
 ctx=$(PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"session_id":"fake1-s1","source":"startup"}')
 check "session start records the harness session" last_record "$PPI_HOME/session/fake1" '.session == "fake1-s1"'
+check "who drops that note once SessionStart records a session" fails_with bash -c '"$1" who | grep -q "^fake1 .*no harness session recorded"' _ "$PPI"
 PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"session_id":"fake1-s2","source":"compact"}' >/dev/null
 check "compaction records no new session" last_record "$PPI_HOME/session/fake1" '.session == "fake1-s1"'
 check "session start names the participant" grep -q 'bus is "fake1"' <<<"$ctx"
 check "session start names the envelope as the trigger" grep -q '\[ppi from=<sender> to=fake1 id=<id> batch=<batch>\]' <<<"$ctx"
-check "session start prints how to send" grep -q "ppi send <participant>" <<<"$ctx"
+check "session start prints how to send, through PPI_BIN" grep -qF '"$PPI_BIN" send <participant>' <<<"$ctx"
+check "session start routes participants only through PPI_BIN, never a same-named tool" \
+  grep -qF 'contact them only with "$PPI_BIN" send, never a same-named tool or subagent' <<<"$ctx"
+check "session start names no bare ppi command" fails_with grep -qE '(^|[ :])ppi (send|who)' <<<"$ctx"
 check "session start prints the send results and loop rules" grep -q "do not resend" <<<"$ctx"
 check "session start says a send to an agent is queued" grep -q "queued for <name> .*at its prompt" <<<"$ctx"
 check "session start no longer describes stop-hook deliveries" fails_with grep -q "Stop hook" <<<"$ctx"
 check "session start says to stop after sending" grep -q "finish your response and stop" <<<"$ctx"
 check "session start says replies go to the sender, who relays" grep -q "the sender relays" <<<"$ctx"
 check "session start says the sender cannot see the pane" grep -q "cannot see your pane" <<<"$ctx"
-check "session start says a reply is a ppi send" grep -q "send the answer to the sender with ppi send" <<<"$ctx"
+check "session start says a reply is a PPI_BIN send" grep -qF 'send the answer to the sender with "$PPI_BIN" send' <<<"$ctx"
 CLAUDE_ENV_FILE="$TMP/claude.env" PPI_ALIAS=fake1 "$PPI" hook session-start <<<'{"session_id":"fake1-s1","source":"startup"}' >/dev/null
 env_resolves() {
-  env -i HOME="$HOME" PATH=/usr/bin:/bin bash -c '. "$1" && [ "$(command -v ppi)" = "$2" ] && [ "$PPI_ALIAS" = fake1 ] && [ "$PPI_HOME" = "$3" ]' \
+  env -i HOME="$HOME" PATH=/usr/bin:/bin bash -c '. "$1" && [ "$(command -v ppi)" = "$2" ] && [ "$PPI_ALIAS" = fake1 ] && [ "$PPI_HOME" = "$3" ] && [ "$PPI_BIN" = "$2" ]' \
     _ "$TMP/claude.env" "$PPI" "$PPI_HOME"
 }
-check "session start exports ppi, alias, and home for Claude's Bash tool" env_resolves
+check "session start exports ppi, PPI_BIN, alias, and home for Claude's Bash tool" env_resolves
 
 printf '@fake1 via console\n@fake1\n/quit\n' | "$PPI" console >/dev/null 2>&1
 check "console @alias queues as operator" queued_from "$PPI_HOME/queue/fake1" operator "via console"
@@ -237,7 +242,7 @@ for runtime in claude codex; do
   [ "$runtime" = claude ] || key=turn_id
   ctx=$(plugin_hook "$runtime" SessionStart <<<"{\"session_id\":\"$runtime-s\",\"source\":\"startup\"}")
   check "$runtime SessionStart records the harness session" last_record "$PPI_HOME/session/fake2" ".session == \"$runtime-s\""
-  check "$runtime SessionStart prints the contract" grep -q 'ppi send <participant>' <<<"$ctx"
+  check "$runtime SessionStart prints the contract" grep -qF '"$PPI_BIN" send <participant>' <<<"$ctx"
   out=$(plugin_hook "$runtime" UserPromptSubmit <<<"{\"session_id\":\"$runtime-s\",\"$key\":\"$runtime-p\",\"prompt\":\"hi\"}")
   check "$runtime UserPromptSubmit prints nothing" [ -z "$out" ]
   check "$runtime UserPromptSubmit records the prompt with its $key" \
@@ -266,7 +271,7 @@ cp "$PPI_HOME/queue/fake1" "$TMP/queue-before"
 limit_rc=0
 limit_out=$(PPI_ALIAS=fake2 "$PPI" send fake1 "limit rejected" 2>&1) || limit_rc=$?
 check "the 21st agent-to-agent send exits 1" [ "$limit_rc" -eq 1 ]
-check "a blocked sender is directed to the operator" grep -q 'ppi send operator' <<<"$limit_out"
+check "a blocked sender is directed to the operator through PPI_BIN" grep -qF '"$PPI_BIN" send operator' <<<"$limit_out"
 check "the blocked send is logged" logged fake1 blocked
 check "a blocked send queues nothing" cmp -s "$TMP/queue-before" "$PPI_HOME/queue/fake1"
 check "a blocked send leaves the count at 20" turns_are 20
@@ -512,8 +517,8 @@ fix_status "done"
 out=$(stick sa)
 B1=$(jq -r .batch <<<"$out")
 T1=$(jq -r .text <<<"$out")
-env1=$'[ppi from=operator to=sa id=1 batch=3] first\n[ppi: if this needs an answer: ppi send operator, then stop]'
-env2=$'[ppi from=sb to=sa id=2 batch=3] second\n[ppi: if this needs an answer: ppi send sb, then stop]'
+env1=$'[ppi from=operator to=sa id=1 batch=3] first\n[ppi: if this needs an answer: "$PPI_BIN" send operator, then stop]'
+env2=$'[ppi from=sb to=sa id=2 batch=3] second\n[ppi: if this needs an answer: "$PPI_BIN" send sb, then stop]'
 check "the startup pair validates the arm, and its queue goes out as one paste" action_is "$out" paste
 check "the batch id comes from the message counter" [ "$B1" = 3 ]
 check "the paste is both envelopes in order, with the batch id and answer hints" [ "$T1" = "$env1"$'\n'"$env2" ]
@@ -538,8 +543,8 @@ check "release records stop_hook_active" batch_is "$B1" .stop_hook_active true
 out=$(stick sa)
 B2=$(jq -r .batch <<<"$out")
 T2=$(jq -r .text <<<"$out")
-env4="[ppi from=operator to=sa id=4 batch=$B2] third"$'\n[ppi: if this needs an answer: ppi send operator, then stop]'
-env5="[ppi from=sb to=sa id=5 batch=$B2] fourth"$'\n[ppi: if this needs an answer: ppi send sb, then stop]'
+env4="[ppi from=operator to=sa id=4 batch=$B2] third"$'\n[ppi: if this needs an answer: "$PPI_BIN" send operator, then stop]'
+env5="[ppi from=sb to=sa id=5 batch=$B2] fourth"$'\n[ppi: if this needs an answer: "$PPI_BIN" send sb, then stop]'
 check "after release the next batch goes out" [ "$T2" = "$env4"$'\n'"$env5" ]
 syn "$PPI" batch submitted "$B2" >/dev/null
 n=0
@@ -794,6 +799,39 @@ check "the stale Stop is logged as a late callback" \
   quiet_jq -se --argjson b "$bg" 'any(.[]; .batch == $b and .status == "late-callback")' "$SYN/bus.jsonl"
 stick sg >/dev/null
 check "a tick holds a previous session's batch as uncertain" batch_is "$bg" '"\(.disposition) \(.reason)"' "uncertain session"
+
+# Claude's long-paste wrapper, from a captured hook input: the fixture prompt with its body replaced.
+FIXTURES=$ROOT/test/fixtures
+wrapped_in() { # session prompt-id batch-text [jq filter applied to the wrapped prompt]
+  jq -cn --rawfile p "$FIXTURES/claude-long-paste.prompt.txt" --rawfile b "$FIXTURES/claude-long-paste.batch.txt" \
+    --arg s "$1" --arg id "$2" --arg t "$3" "{session_id: \$s, prompt_id: \$id, prompt: (\$p | split(\$b) | join(\$t) | ${4:-.})}"
+}
+check "the captured prompt is the batch text inside one wrapper (fixture)" \
+  quiet_jq -ne --rawfile p "$FIXTURES/claude-long-paste.prompt.txt" --rawfile b "$FIXTURES/claude-long-paste.batch.txt" \
+  '($p | split($b)) == ["\n\n<pasted_content id=\"f6c5\">\n", "\n</pasted_content id=\"f6c5\">\n"]'
+validate sw W1
+ssend operator sw "a long batch"
+out=$(stick sw)
+bw=$(jq -r .batch <<<"$out")
+TW=$(jq -r .text <<<"$out")
+syn "$PPI" batch submitted "$bw" >/dev/null
+n=0
+for filter in 'sub("id=\"f6c5\">\n$"; "id=\"0000\">\n")' 'sub("a long batch"; "a long patch")' '"note: " + .' 'rtrimstr("\n")'; do
+  n=$((n + 1))
+  shook sw prompt "$(wrapped_in W1 "W1-v$n" "$TW" "$filter")"
+done
+check "a wrapper with unequal ids, an altered body, outside text, or a missing newline never binds" batch_is "$bw" .pid null
+shook sw prompt "$(wrapped_in W1 W1-1 "$TW")"
+check "Claude's long-paste wrapper around the exact batch text binds it" batch_is "$bw" '"\(.evidence) \(.pid)"' "observed W1-1"
+syn env REX_BLOCK=block:sv "$PPI" run --runtime fake sv true
+RUNTIME=fake shook sv session-start '{"session_id":"V1","source":"startup"}' >/dev/null
+RUNTIME=fake shook sv prompt '{"session_id":"V1","prompt_id":"V1-0","prompt":"Startup check"}'
+RUNTIME=fake shook sv stop '{"session_id":"V1","prompt_id":"V1-0","stop_hook_active":false}'
+ssend operator sv "a long batch"
+out=$(syn "$PPI" batch tick sv --status "$(rec idle)" --process "$(cat "$STUB/process.json")")
+bv=$(jq -r .batch <<<"$out")
+RUNTIME=fake shook sv prompt "$(wrapped_in V1 V1-1 "$(jq -r .text <<<"$out")")"
+check "the wrapper is unwrapped for a claude arm only" batch_is "$bv" .pid null
 
 # The dispatcher end to end, on a bus of its own, delivering to stand-in harnesses.
 DH=$TMP/dhome
