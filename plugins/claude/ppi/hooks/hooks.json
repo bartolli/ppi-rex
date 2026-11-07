@@ -1,5 +1,5 @@
 {
-  "description": "Report idle and busy state to the ppi bus and hand queued messages to Claude at the end of a turn.",
+  "description": "Record Claude Code's sessions, prompts, and turn ends for the ppi Rex bus; the bus delivers only at its prompt.",
   "hooks": {
     "SessionStart": [
       { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook session-start", "timeout": 10 }] }
@@ -9,12 +9,6 @@
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook stop", "timeout": 10 }] }
-    ],
-    "Notification": [
-      {
-        "matcher": "idle_prompt",
-        "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook idle", "timeout": 10 }]
-      }
     ]
   }
 }

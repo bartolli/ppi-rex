@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "ppi",
-  "version": "0.3.0",
-  "description": "Hooks that let the ppi Rex message bus deliver to Claude Code only at its prompt.",
+  "version": "0.4.0",
+  "description": "Observer hooks that let the ppi Rex message bus deliver to Claude Code only at its prompt.",
   "author": {
     "name": "Angel Bartolli"
   }

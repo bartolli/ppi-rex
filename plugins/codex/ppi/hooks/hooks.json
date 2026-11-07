@@ -8,6 +8,9 @@
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook stop", "timeout": 10 }] }
+    ],
+    "Interrupt": [
+      { "hooks": [{ "type": "command", "command": "[ -z \"${PPI_BIN:-}\" ] || \"$PPI_BIN\" hook interrupt", "timeout": 3 }] }
     ]
   }
 }

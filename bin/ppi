@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
 # ppi: ping pong interactive, a message bus between agents running in Rex panes.
 #
-#   ppi run [--runtime <name>] <alias> <command> [args...]
+#   ppi run --runtime <name> <alias> <command> [args...]
 #                                         register this pane as <alias>, then exec the agent
-#   ppi send <to> <message...>            message a participant (sender is $PPI_ALIAS)
-#   ppi release <alias>                   agent is at its prompt: deliver its queue, or mark it idle
-#   ppi deliver <alias>                   deliver its queue if it is idle (the monitor runs this)
-#   ppi who                               list participants, panes, and states
-#   ppi monitor                           follow the bus log; delivers messages left pending
+#   ppi send <to> <message...>            queue a message for a participant (sender is $PPI_ALIAS)
+#   ppi who                               participants, holds, batches, and the dispatcher
 #   ppi console                           operator prompt: @<alias> <message>
+#   ppi ready <alias>                     the operator returned <alias> to a clean prompt
 #   ppi up [config]                       build the workspace for an arms config around this pane
-#   ppi hook <session-start|prompt|stop|idle>   agent hook entry points
+#   ppi dispatch                          deliver queued messages; runs as the ppi bus tab's own program
+#   ppi batch <tick|check|submitted|uncertain|requeue|dismiss|restart> ...
+#                                         queue operations for the dispatcher and the console
+#   ppi hook <session-start|prompt|stop|interrupt>   agent hook entry points
 set -euo pipefail
 
 # Resolve symlinks: a ppi linked onto PATH must hand panes and hooks its real path.
 BIN_DIR=$(dirname "$(readlink -f "$0")")
 SELF="$BIN_DIR/ppi"
 STARTUP_PROMPT="Startup check: reply ok. This instruction applies to this message only; do not call tools."
-# Paste and Enter go out as separate writes; the gap keeps a TUI from reading Enter as part of the paste.
-SUBMIT_DELAY=0.3
+# Seconds a submitted batch may wait for its UserPromptSubmit before it is uncertain.
+OBSERVE_DEADLINE=10
 LOCKED=()
 CHECK_ERR=""
 
@@ -28,14 +29,20 @@ valid_name() { # what value
   case $2 in "" | *[!a-z0-9_-]*) die "invalid $1 '$2' (use a-z 0-9 _ -)" ;; esac
 }
 
-init_home() {
+# Fails instead of dying, so a hook can stay silent outside a bus.
+bus_home() {
   local key
-  [ -n "${REX_SESSION:-}" ] || die "not inside a Rex terminal (REX_SESSION unset)"
   # The ID, not the label: a session can be renamed while the bus runs.
-  key=${REX_SESSION#session:}
-  case $key in "" | *[!0-9a-f-]*) die "invalid REX_SESSION '$REX_SESSION'" ;; esac
+  key=${REX_SESSION:-}
+  key=${key#session:}
+  case $key in "" | *[!0-9a-f-]*) return 1 ;; esac
   PPI_HOME=${PPI_HOME:-/tmp/ppi-$(id -u)/rex-$key}
-  mkdir -p "$PPI_HOME/panes" "$PPI_HOME/state" "$PPI_HOME/queue"
+}
+
+init_home() {
+  [ -n "${REX_SESSION:-}" ] || die "not inside a Rex terminal (REX_SESSION unset)"
+  bus_home || die "invalid REX_SESSION '$REX_SESSION'"
+  mkdir -p "$PPI_HOME"/{panes,queue,session,prompts,stops,batches,holds,ready,locks}
   touch "$PPI_HOME/bus.jsonl"
 }
 
@@ -43,22 +50,37 @@ init_home() {
 # and a stuck call must end inside the 10-second hook budget.
 rx() { "${REX_BIN_DIR:+$REX_BIN_DIR/}rex" --autostart=false --timeout 3s "$@"; }
 
-log() { # from to status msg id
+log() { # from to status msg [id]
   jq -cn --arg ts "$(date +%H:%M:%S)" --arg from "$1" --arg to "$2" \
-    --arg status "$3" --arg msg "$4" --arg id "$5" \
+    --arg status "$3" --arg msg "$4" --argjson id "${5:-null}" \
     '{ts: $ts, id: $id, from: $from, to: $to, status: $status, msg: $msg}' >> "$PPI_HOME/bus.jsonl"
 }
+log_batch() { # batch to status msg
+  jq -cn --arg ts "$(date +%H:%M:%S)" --argjson batch "$1" --arg to "$2" --arg status "$3" --arg msg "$4" \
+    '{ts: $ts, batch: $batch, from: "ppi", to: $to, status: $status, msg: $msg}' >> "$PPI_HOME/bus.jsonl"
+}
+
+# Readers never see a partial record: write a hidden file beside the target, then rename it.
+put() { # file; content on stdin
+  local tmp="${1%/*}/.${1##*/}.$$"
+  cat > "$tmp" && mv -f "$tmp" "$1"
+}
+append() { # file line
+  { [ ! -e "$1" ] || cat "$1"; printf '%s\n' "$2"; } | put "$1"
+}
+cat_if() { [ ! -e "$1" ] || cat "$1"; }
 
 # mkdir is atomic, and flock(1) does not ship with macOS.
-lock() {
-  local dir="$PPI_HOME/state/$1.lock" tries=0
+lock_try() { # name seconds
+  local dir="$PPI_HOME/locks/$1.lock" tries=$(($2 * 20))
   until mkdir "$dir" 2>/dev/null; do
-    tries=$((tries + 1))
-    [ "$tries" -lt 100 ] || die "lock held: $dir (remove it if stale)"
+    tries=$((tries - 1))
+    [ "$tries" -gt 0 ] || return 1
     sleep 0.05
   done
   LOCKED[${#LOCKED[@]}]=$dir
 }
+lock() { lock_try "$1" 5 || die "lock held: $PPI_HOME/locks/$1.lock (remove it if stale)"; }
 unlock() {
   local i
   for ((i=${#LOCKED[@]}-1; i>=0; i--)); do
@@ -77,10 +99,19 @@ turn_count() {
   esac
 }
 
-state_of() { cat "$PPI_HOME/state/$1" 2>/dev/null || echo unknown; }
-set_state() { echo "$2" > "$PPI_HOME/state/$1"; }
+# Message and batch ids share one bus-wide sequence. Caller holds the .turns lock.
+next_id() {
+  local n=0
+  [ ! -e "$PPI_HOME/counter" ] || n=$(cat "$PPI_HOME/counter")
+  case $n in "" | *[!0-9]*) die "invalid counter in $PPI_HOME/counter" ;; esac
+  n=$((n + 1))
+  printf '%s\n' "$n" | put "$PPI_HOME/counter"
+  echo "$n"
+}
+
 queued() { [ -s "$PPI_HOME/queue/$1" ]; }
 known() { ls "$PPI_HOME/panes" | tr '\n' ' '; }
+registered() { [ -f "$PPI_HOME/panes/$1" ] || die "unknown participant '$1' (known: $(known))"; }
 
 # Sets CHECK_ERR when the alias's pane cannot take input.
 # Returns 1 when the pane is not running, 2 when this process cannot reach the multiplexer (e.g. a sandboxed agent).
@@ -93,7 +124,7 @@ check_pane() {
 }
 
 # rex exits 3 for a block that no longer exists. Any other failure counts as unreachable,
-# which leaves the message pending for the monitor rather than refusing it.
+# which queues the message for the dispatcher rather than refusing it.
 rex_alive() {
   local out rc=0 status=""
   out=$(rx block call -s "$REX_SESSION" -b "$1" process 2>&1) || rc=$?
@@ -109,52 +140,425 @@ rex_alive() {
   return 2
 }
 
-# A paste event is bracketed when the program asks for one, so a multi-line delivery submits once.
-# rex send would type the text unbracketed.
-rex_inject() {
-  jq -cn --arg block "$1" --arg text "$2" '{block_id: $block, event: {type: "paste", payload: {text: $text}}}' \
-    | rx api call -s "$REX_SESSION" block.event - >/dev/null || return 1
-  sleep "$SUBMIT_DELAY"
-  rx send-key -s "$REX_SESSION" -b "$1" enter >/dev/null
-}
-
-envelopes() {
-  # The trailing hint is the one instruction a model reads at the moment it matters.
-  jq -r --arg to "$1" \
-    '"[ppi from=\(.from) to=\($to) id=\(.id)] \(.msg)\n[ppi: if this needs an answer: ppi send \(.from), then stop]"' \
-    "$PPI_HOME/queue/$1"
-}
-
-# Hand the whole queue to the agent. Caller holds the lock.
-# via=inject types it into the pane; via=stop prints a Stop-hook block decision.
-drain() {
-  local alias=$1 via=$2 text pane
-  queued "$alias" || return 0
-  text=$(envelopes "$alias")
-  if [ "$via" = inject ]; then
-    check_pane "$alias" || return 1
-    pane=$(cat "$PPI_HOME/panes/$alias")
-    CHECK_ERR="typing into pane $pane failed"
-    rex_inject "$pane" "$text" || return 1
-  else
-    # Harnesses label a blocking Stop hook as an error; say what it is before the envelope.
-    jq -cn --arg reason "ppi: message delivered at the end of your turn, not an error. Handle it as a new bus message.
-$text" '{decision: "block", reason: $reason}'
+# Snapshot of one block as the readiness rules see it. REX_REACH is ok, gone (rex exits 3 for a
+# missing block), or unknown; unknown is never taken as proof that the recipient is gone.
+read_rex() { # block
+  local rc=0
+  REX_STATUS="" REX_PROCESS="" REX_REACH=ok
+  REX_PROCESS=$(rx block call -s "$REX_SESSION" -b "$1" process 2>/dev/null) || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    REX_STATUS=$(rx block call -s "$REX_SESSION" -b "$1" program_status 2>/dev/null) || rc=$?
   fi
-  jq -c --arg ts "$(date +%H:%M:%S)" --arg to "$alias" \
-    '{ts: $ts, id, from, to: $to, status: "delivered", msg}' "$PPI_HOME/queue/$alias" >> "$PPI_HOME/bus.jsonl"
-  : > "$PPI_HOME/queue/$alias"
-  set_state "$alias" busy
+  case $rc in 0) ;; 3) REX_REACH=gone ;; *) REX_REACH=unknown ;; esac
+}
+
+# The state model. Every decision is one jq program over one alias's records (bus, below);
+# it returns {out, writes} and bash only applies the writes, in order. See docs/plan.md.
+JQ_LIB='
+def ts: try (capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<f>[.][0-9]+)?(?<z>Z|[+-][0-9]{2}:[0-9]{2})$")
+    | ((.d + "Z") | fromdateiso8601) + (("0" + (.f // "")) | tonumber)
+      - (if .z == "Z" then 0 else ((.z[0:1] + "1") | tonumber) * ((.z[1:3] | tonumber) * 3600 + (.z[4:6] | tonumber) * 60) end))
+  catch null;
+def rank: {attempting: 0, submitted: 1, observed: 2}[.] // -1;
+def root: [(.records // []) | if type == "array" then .[] else empty end | select((.id // "") == "")] | first;
+def app_of($runtime): {claude: "claude-code", codex: "codex"}[$runtime] // $runtime;
+def envelopes($to; $b):
+  [.[] | "[ppi from=\(.from) to=\($to) id=\(.id) batch=\($b)] \(.msg)\n[ppi: if this needs an answer: ppi send \(.from), then stop]"]
+  | join("\n");
+def logline($b; $to; $status; $msg):
+  {op: "log", path: "", json: {ts: (now | strflocaltime("%H:%M:%S")), batch: $b, from: "ppi", to: $to, status: $status, msg: $msg}};
+def putbatch: {op: "put", path: "batches/\(.id)", json: .};
+def uncertain($reason; $detail): .disposition = "uncertain" | .reason = $reason | .detail = $detail | .hr_uncertain = now;
+
+def current: [.batches[] | select(.disposition == "active" or .disposition == "uncertain")] | first;
+def latest_seq: [.prompts[].seq] | max // 0;
+def maxbatch: [.batches[].id] | max // 0;
+# A batch is bound to the registration and the SessionStart generation it was reserved under;
+# a callback or check for any other binding is stale.
+def unbound($x):
+  if .block != $x.block then "registration"
+  elif .session.session != $x.session or .session.gen != $x.session_gen then "session"
+  else null end;
+# A failed SessionStart holds whatever the session, since the session record itself may be stale.
+def holding:
+  (.session.session // "") as $s
+  | [.holds[] | select(.event == "session-start" or (.session // "") == "" or .session == $s)];
+def stopped($stops; $session; $pid):
+  ($pid // "") != "" and any($stops[]; .event == "stop" and .session == $session and .pid == $pid);
+def liveness:
+  (.status | root) as $r
+  | if .reach == "gone" or (.process.last_exit // null) != null then "gone"
+    elif .reach != "ok" or $r == null then "no-status"
+    elif ($r.owner.pid // null) == null or (.process.foreground.pid // null) == null
+      or $r.owner.pid != .process.foreground.pid or $r.owner.name != .process.foreground.name then "no-identity"
+    else null end;
+def status_hold:
+  (.status | root) as $r
+  | if $r.state == "working" then "busy"
+    elif $r.state == "blocked" then "blocked"
+    elif ($r.state | IN("idle", "done") | not) then "no-status"
+    elif .session != null and ((.session.runtime // "") == "" or $r.effective_app != app_of(.session.runtime)) then "wrong-app"
+    else null end;
+def baseline_ok:
+  (.status | root) as $r | .ready as $b
+  | $b != null and $b.block == .block and $b.session == .session.session
+    and $b.prompt_seq == latest_seq and $b.state == $r.state and $b.updated_at == $r.updated_at
+    and $b.owner_pid == $r.owner.pid and $b.owner_name == $r.owner.name
+    and $b.gen == .session.gen and $b.batch == maxbatch;
+def startup_ok:
+  . as $in | .session as $s
+  | $s != null and any(.prompts[] | select(.session == $s.session and .seq > ($s.since // 0)); stopped($in.stops; .session; .pid));
+def validation:
+  .session as $s | (.prompts | max_by(.seq)) as $last
+  | if (startup_ok | not) or $last.session != $s.session or $last.seq <= ($s.since // 0) then "unvalidated"
+    elif stopped(.stops; $last.session; $last.pid) or baseline_ok then null
+    else "no-stop" end;
+def readiness:
+  liveness // (current | if . == null then null else "outstanding \(.id)" end) // status_hold
+  // (if (holding | length) > 0 then "hook-failure" else null end) // validation;
+
+def exit_reason:
+  if .closed then "closed" elif .reach == "gone" or (.process.last_exit // null) != null then "exited" else null end;
+def deadline:
+  current as $c | (.status | root) as $r
+  | if $c == null or $c.disposition != "active" then null
+    elif $c.evidence == "submitted" and (.now - ($c.hr_submitted // .now)) > .deadline then "no-observation"
+    elif $c.evidence == "observed" and .reach == "ok" and $r != null and ($r.state | IN("idle", "done"))
+      and (($r.updated_at | ts) // 0) > ($c.hr_observed // 0)
+      and (stopped(.stops; $c.session; $c.pid) | not) then "no-stop"
+    else null end;
+# One home per message id: drop queued ids a batch owns, restore requeued ids that have no home.
+def reconciled:
+  ([.batches[] | select(.disposition | IN("active", "uncertain", "released", "dismissed")) | .ids[]]) as $owned
+  | [.queue[] | select(.id | IN($owned[]) | not)] as $q
+  | reduce ([.batches[] | select(.disposition == "superseded" and .requeued == true)] | sort_by(.id) | .[].messages[]) as $m
+      ({q: $q, seen: ([$q[].id] + $owned)};
+       if any(.seen[]; . == $m.id) then . else .q += [$m] | .seen += [$m.id] end)
+  | .q;
+
+def tick($counter):
+  .queue as $before
+  | .queue = reconciled
+  | current as $c
+  | (if $c != null and $c.disposition == "active" then (unbound($c) // exit_reason // deadline) else null end) as $why
+  | (if $why then {action: "hold", reason: "outstanding \($c.id)"}
+     elif .reach == "none" and ((.queue | length) > 0 or $c != null) then {action: "status"}
+     elif (.queue | length) == 0 then {action: "none"}
+     else readiness as $h | if $h then {action: "hold", reason: $h} else {action: "paste"} end end) as $act
+  | if $act.action == "paste" then
+      ($counter + 1) as $b
+      | (.alias as $a
+         | {id: $b, to: $a, block: .block, session: .session.session, session_gen: .session.gen,
+            ids: [.queue[].id], messages: .queue,
+            text: (.queue | envelopes($a; $b)), evidence: "attempting", disposition: "active", reason: null,
+            pid: null, prompt_seq: null, reserved_seq: latest_seq, baseline: baseline_ok, hr_reserved: now}) as $x
+      | {out: {action: "paste", batch: $b, block: .block, text: $x.text},
+         writes: [{op: "put", path: "counter", json: $b}, ($x | putbatch),
+                  {op: "lines", path: "queue/\(.alias)", json: []}, {op: "rm", path: "ready/\(.alias)"},
+                  logline($b; .alias; "reserved"; "ids \($x.ids | map(tostring) | join(","))")]}
+    else
+      {out: $act,
+       writes: ((if .queue != $before then [{op: "lines", path: "queue/\(.alias)", json: .queue}] else [] end)
+                + (if $why then [($c | uncertain($why; null) | putbatch), logline($c.id; .alias; "uncertain"; $why)] else [] end))}
+    end;
+
+def check($id):
+  ([.batches[] | select(.id == $id)] | first) as $x
+  | if $x == null then error("no batch \($id) for \(.alias)")
+    elif $x.disposition != "active" or $x.evidence != "attempting" then
+      {out: {result: "stale", note: "\($x.disposition)/\($x.evidence)"},
+       writes: [logline($id; .alias; "late-callback"; "check on \($x.disposition)/\($x.evidence)")]}
+    else
+      (unbound($x)
+       // (if latest_seq != $x.reserved_seq then "prompt"
+           elif (holding | length) > 0 then "hook-failure"
+           else liveness // status_hold end)) as $why
+      | if $why then
+          {out: {result: "preempted", reason: $why},
+           writes: [($x | uncertain("preempted"; $why) | putbatch), logline($id; .alias; "uncertain"; "preempted: \($why)")]}
+        else {out: {result: "ok"}, writes: []} end
+    end;
+
+def op($id; $op; $reason):
+  ([.batches[] | select(.id == $id)] | first) as $x
+  | if $x == null then error("no batch \($id) for \(.alias)") else . end
+  | (if $op == "submitted" then
+       (if ($x.disposition | IN("active", "uncertain")) and unbound($x) == null
+        then {r: "ok", b: ($x | .evidence |= (if rank < 1 then "submitted" else . end) | .hr_submitted //= now)}
+        else {r: "stale"} end)
+     elif $op == "uncertain" then
+       (if $x.disposition == "active" then {r: "ok", b: ($x | uncertain($reason; null))} else {r: "stale"} end)
+     elif $op == "requeue" then
+       (if $x.disposition == "uncertain" then {r: "ok", b: ($x | .disposition = "superseded" | .requeued = true | .hr_resolved = now)}
+        elif $x.disposition == "superseded" then {r: "ok"} else {r: "stale"} end)
+     elif $op == "dismiss" then
+       (if $x.disposition == "uncertain" then {r: "ok", b: ($x | .disposition = "dismissed" | .hr_resolved = now)}
+        elif $x.disposition == "dismissed" then {r: "ok"} else {r: "stale"} end)
+     else error("unknown operation \($op)") end) as $d
+  | (.batches |= map(if .id == $id and $d.b != null then $d.b else . end) | reconciled) as $q
+  | ($d.b // $x) as $y
+  | {out: {result: $d.r, changed: ($d.b != null), batch: $id, disposition: $y.disposition, evidence: $y.evidence},
+     writes: ((if $d.b then [($d.b | putbatch),
+                             logline($id; .alias; (if $op == "submitted" then "submitted" else $y.disposition end); $reason)]
+               else [] end)
+              + (if $q != .queue then [{op: "lines", path: "queue/\(.alias)", json: $q}] else [] end)
+              + (if $d.r == "stale" then [logline($id; .alias; "late-callback"; "\($op) on \($x.disposition)/\($x.evidence)")]
+                 else [] end))};
+# A dispatcher start: an attempt that may have been mid-input when the last dispatcher ended is
+# held for the operator; an observed one stays active, since its Stop can still arrive.
+def restart:
+  .queue as $before
+  | .queue = reconciled
+  | current as $c
+  | ($c != null and $c.disposition == "active" and ($c.evidence | IN("attempting", "submitted"))) as $held
+  | {out: {result: "ok", batch: (if $held then $c.id else null end)},
+     writes: ((if .queue != $before then [{op: "lines", path: "queue/\(.alias)", json: .queue}] else [] end)
+              + (if $held then [($c | uncertain("restart"; null) | putbatch), logline($c.id; .alias; "uncertain"; "restart")]
+                 else [] end))};
+
+def on_session($h; $runtime):
+  if ($h.session_id // "") == "" then error("SessionStart input has no session_id") else . end
+  | {out: null,
+     writes: [{op: "put", path: "session/\(.alias)",
+               json: {session: $h.session_id, runtime: $runtime, hr: now, since: latest_seq, gen: ((.session.gen // 0) + 1)}},
+              {op: "rm", path: "ready/\(.alias)"}]};
+# Correlation is equality of the whole prompt with the batch text, in the bound harness session.
+def on_prompt($h):
+  ($h.session_id // "") as $s | ($h.prompt_id // $h.turn_id // "") as $pid | ($h.prompt // "") as $text
+  | (latest_seq + 1) as $seq | current as $c
+  | ($c != null and $s != "" and $c.session == $s and unbound($c) == null and $c.pid == null and $c.text == $text) as $match
+  | {out: null,
+     writes: ([{op: "append", path: "prompts/\(.alias)",
+                json: {seq: $seq, hr: now, session: $s, pid: $pid,
+                       batch: (if $match then $c.id else null end), ids: (if $match then $c.ids else null end)}}]
+       + (if $match then
+            [($c | .evidence = "observed" | .pid = $pid | .prompt_seq = $seq | .hr_observed = now | putbatch),
+             logline($c.id; .alias; "observed"; "prompt \($seq)")]
+          elif $c != null and $c.disposition == "active" then
+            (unbound($c) // "intervening") as $why
+            | [($c | uncertain($why; "prompt \($seq)") | putbatch), logline($c.id; .alias; "uncertain"; "\($why), prompt \($seq)")]
+          else [] end)
+       + [{op: "rm", path: "ready/\(.alias)"}])};
+def on_end($h; $event):
+  ($h.session_id // "") as $s | ($h.prompt_id // $h.turn_id // "") as $pid
+  | (([.stops[].seq] | max // 0) + 1) as $seq | current as $c
+  | ($c != null and $c.disposition == "active" and $s != "" and $c.session == $s and unbound($c) == null
+     and $pid != "" and $c.pid == $pid) as $mine
+  | {out: null,
+     writes: ([{op: "append", path: "stops/\(.alias)",
+                json: {seq: $seq, hr: now, session: $s, pid: $pid, event: $event, stop_hook_active: $h.stop_hook_active}}]
+       + (if $mine and $event == "stop" and $c.evidence == "observed" then
+            [($c | .disposition = "released" | .reason = "stop" | .stop_hook_active = $h.stop_hook_active | .hr_released = now | putbatch),
+             logline($c.id; .alias; "released"; "stop")]
+          elif $mine and $event == "interrupt" then
+            [($c | uncertain("interrupted"; null) | putbatch), logline($c.id; .alias; "uncertain"; "interrupted")]
+          else
+            ([.batches[] | select($pid != "" and .pid == $pid and .session == $s)] | first) as $old
+            | if $old then [logline($old.id; .alias; "late-callback"; "\($event) on \($old.disposition)/\($old.evidence)")] else [] end
+          end))};
+
+def ready_snapshot:
+  {block, session: .session.session, gen: .session.gen, seq: latest_seq, batch: maxbatch, gens: ([holding[].generation] | sort)};
+def confirm($snap):
+  (.status | root) as $r
+  | if ready_snapshot != $snap then {out: {result: "changed"}, writes: []}
+    elif (.session.session // null) == null then {out: {result: "hold", reason: "no harness session recorded yet"}, writes: []}
+    elif (current // {}).disposition == "active" then {out: {result: "hold", reason: "batch \(current.id) is in flight"}, writes: []}
+    else (liveness // status_hold) as $why
+    | if $why then {out: {result: "hold", reason: $why}, writes: []}
+      else {out: {result: "ok", prompt_seq: latest_seq, acknowledged: $snap.gens},
+            writes: ([{op: "put", path: "ready/\(.alias)",
+                       json: {block, session: .session.session, gen: .session.gen, batch: maxbatch,
+                              prompt_seq: latest_seq, state: $r.state, updated_at: $r.updated_at,
+                              owner_pid: $r.owner.pid, owner_name: $r.owner.name, hold_generations: $snap.gens, hr: now}}]
+                     + [$snap.gens[] as $g | {op: "rm", path: "holds/\(.alias)/\($g).json"}]
+                     + [logline(null; .alias; "ready"; "baseline at prompt \(latest_seq)")])}
+      end
+    end;
+
+def who_line:
+  (.status | root) as $r | current as $c | readiness as $h
+  | [.alias, "block=\(.block)", (if startup_ok then "validated" else "unvalidated" end),
+     "state=\(if .reach == "ok" then ($r.state // "none") else "unknown" end)", "queued=\(.queue | length)",
+     (if $h then "hold=\($h)" else "ready" end)]
+    + (if $c then ["batch=\($c.id) \($c.evidence)/\($c.disposition)\(if $c.reason then " " + $c.reason else "" end)"] else [] end)
+    + (if .ready then ["baseline"] else [] end)
+  | join(" ");
+'
+# The one input every decision reads; it needs alias_jq's named arguments.
+BUS_IN='
+def bus:
+  {alias: $alias, block: ($block | rtrimstr("\n")), session: $session[0], prompts: $prompts, stops: $stops,
+   batches: [$batches[] | select(.to == $alias)], holds: $holds, ready: $ready[0], queue: $queue,
+   status: ($status | fromjson? // null), process: ($process | fromjson? // null), closed: $closed,
+   now: now, deadline: $deadline}
+  | .reach = (if $reach == "ok" and (.status == null or .process == null) then "unknown" else $reach end);
+'
+SNAP_STATUS="" SNAP_PROCESS="" SNAP_REACH=none SNAP_CLOSED=false
+
+# Run a program over one alias's records, with the snapshot in SNAP_*.
+alias_jq() { # alias program [jq args...]
+  local d=$PPI_HOME a=$1 program=$2
+  shift 2
+  jq -cn --arg alias "$a" --rawfile block "$d/panes/$a" \
+    --slurpfile session <(cat_if "$d/session/$a") \
+    --slurpfile prompts <(cat_if "$d/prompts/$a") \
+    --slurpfile stops <(cat_if "$d/stops/$a") \
+    --slurpfile batches <(cat "$d"/batches/* 2>/dev/null) \
+    --slurpfile holds <(cat "$d/holds/$a"/*.json 2>/dev/null) \
+    --slurpfile ready <(cat_if "$d/ready/$a") \
+    --slurpfile queue <(cat_if "$d/queue/$a") \
+    --arg status "$SNAP_STATUS" --arg process "$SNAP_PROCESS" --arg reach "$SNAP_REACH" \
+    --argjson closed "$SNAP_CLOSED" --argjson deadline "$OBSERVE_DEADLINE" \
+    "$@" "$JQ_LIB $BUS_IN bus | $program"
+}
+
+# Apply a decision's writes in order. Paths are relative to PPI_HOME and come from JQ_LIB.
+apply() { # decision
+  local op path json
+  while IFS= read -r op && IFS= read -r path && IFS= read -r json; do
+    case $op in
+      put) printf '%s\n' "$json" | put "$PPI_HOME/$path" ;;
+      lines) jq -c '.[]' <<<"$json" | put "$PPI_HOME/$path" ;;
+      append) append "$PPI_HOME/$path" "$json" ;;
+      rm) rm -f "$PPI_HOME/$path" ;;
+      log) printf '%s\n' "$json" >> "$PPI_HOME/bus.jsonl" ;;
+      *) die "unknown write '$op'" ;;
+    esac
+  done < <(jq -r '.writes[] | .op, .path, (.json | tojson)' <<<"$1")
+}
+
+parse_snapshots() { # [--status <json> --process <json> | --gone | --unknown | --closed]
+  SNAP_STATUS="" SNAP_PROCESS="" SNAP_REACH=none SNAP_CLOSED=false
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --status | --process)
+        [ $# -ge 2 ] || die "$1 needs a JSON value"
+        if [ "$1" = --status ]; then SNAP_STATUS=$2; else SNAP_PROCESS=$2; fi
+        shift 2
+        ;;
+      --gone) SNAP_REACH=gone; shift ;;
+      --unknown) SNAP_REACH=unknown; shift ;;
+      --closed) SNAP_REACH=gone SNAP_CLOSED=true; shift ;;
+      *) die "unknown option '$1'" ;;
+    esac
+  done
+  if [ "$SNAP_REACH" = none ] && [ -n "$SNAP_STATUS$SNAP_PROCESS" ]; then
+    [ -n "$SNAP_STATUS" ] && [ -n "$SNAP_PROCESS" ] || die "--status and --process go together"
+    SNAP_REACH=ok
+  fi
+}
+
+batch_alias() { # batch -> its recipient; to is immutable, so no lock is needed to read it
+  case $1 in "" | *[!0-9]*) die "invalid batch id '$1'" ;; esac
+  [ -f "$PPI_HOME/batches/$1" ] || die "no batch $1"
+  jq -r .to "$PPI_HOME/batches/$1"
+}
+
+cmd_batch() {
+  local usage="usage: ppi batch <tick <alias> [snapshot] | check <batch> [snapshot] | submitted|uncertain <batch> [reason] | requeue|dismiss <batch> | restart <alias>>"
+  local sub=${1:-} a out
+  [ $# -eq 0 ] || shift
+  [ $# -ge 1 ] || die "$usage"
+  init_home
+  case $sub in
+    tick)
+      a=$1
+      shift
+      valid_name participant "$a"
+      registered "$a"
+      parse_snapshots "$@"
+      # The counter is taken under .turns before the recipient lock, the order ppi send uses.
+      lock .turns
+      lock "$a"
+      out=$(alias_jq "$a" '($counter | rtrimstr("\n") | if . == "" then 0 else tonumber end) as $n | tick($n)' \
+        --rawfile counter <(cat_if "$PPI_HOME/counter"))
+      ;;
+    check)
+      a=$(batch_alias "$1")
+      local b=$1
+      shift
+      parse_snapshots "$@"
+      lock "$a"
+      out=$(alias_jq "$a" 'check($b)' --argjson b "$b")
+      ;;
+    submitted | uncertain | requeue | dismiss)
+      a=$(batch_alias "$1")
+      [ "$sub" != uncertain ] || [ -n "${2:-}" ] || die "usage: ppi batch uncertain <batch> <reason>"
+      lock "$a"
+      out=$(alias_jq "$a" 'op($b; $op; $reason)' --argjson b "$1" --arg op "$sub" --arg reason "${2:-}")
+      ;;
+    restart)
+      a=$1
+      valid_name participant "$a"
+      registered "$a"
+      lock "$a"
+      out=$(alias_jq "$a" restart)
+      ;;
+    *) die "$usage" ;;
+  esac
+  apply "$out"
+  unlock
+  case $sub in
+    requeue | dismiss)
+      local done=requeued
+      [ "$sub" = requeue ] || done=dismissed
+      case $(jq -r '"\(.out.result) \(.out.changed)"' <<<"$out") in
+        "ok true") echo "ppi: batch $1 $done" ;;
+        "ok false") echo "ppi: batch $1 was already $done" ;;
+        *) die "batch $1 is not uncertain ($(jq -r '"\(.out.disposition)/\(.out.evidence)"' <<<"$out")); nothing changed" ;;
+      esac
+      ;;
+    *) jq -c .out <<<"$out" ;;
+  esac
+}
+
+# A hook that cannot record its observation leaves an immutable hold. It takes no lock, since
+# the lock may be what failed; mkdir allocates generations, and the markers are never removed.
+publish_failure() { # alias event input detail
+  local dir="$PPI_HOME/holds/$1" n session
+  session=$(jq -r '.session_id // ""' <<<"$3" 2>/dev/null) || session=""
+  mkdir -p "$dir/.gen"
+  n=$(ls "$dir/.gen" | wc -l)
+  until mkdir "$dir/.gen/$((n + 1))" 2>/dev/null; do
+    n=$((n + 1))
+    [ "$n" -lt 100000 ] || return 1
+  done
+  n=$((n + 1))
+  jq -cn --argjson g "$n" --arg event "$2" --arg session "$session" --arg detail "$4" \
+    '{generation: $g, reason: "hook-failure", event: $event, session: $session, detail: $detail, hr: now}' \
+    | put "$dir/$n.json"
+  log ppi "$1" hook-failure "$2: $4"
+}
+
+observe() { # event input
+  local a=$PPI_ALIAS hook=$2 wait=5 out
+  # Auto-compaction can run mid-turn; it starts no new harness session.
+  if [ "$1" = session-start ] && [ "$(jq -r '.source // ""' <<<"$hook")" = compact ]; then return 0; fi
+  mkdir -p "$PPI_HOME"/{session,prompts,stops,batches,holds,ready,locks}
+  [ -f "$PPI_HOME/panes/$a" ] || die "'$a' is not registered on the bus at $PPI_HOME"
+  # Codex gives Interrupt hooks 3 s.
+  [ "$1" != interrupt ] || wait=1
+  lock_try "$a" "$wait" || die "recipient lock not acquired in $wait s"
+  case $1 in
+    session-start)
+      out=$(alias_jq "$a" '($hook | fromjson) as $h | on_session($h; $runtime)' \
+        --rawfile hook <(printf '%s' "$hook") --arg runtime "${PPI_RUNTIME:-}")
+      ;;
+    prompt) out=$(alias_jq "$a" '($hook | fromjson) as $h | on_prompt($h)' --rawfile hook <(printf '%s' "$hook")) ;;
+    *) out=$(alias_jq "$a" '($hook | fromjson) as $h | on_end($h; $event)' --rawfile hook <(printf '%s' "$hook") --arg event "$1") ;;
+  esac
+  apply "$out"
 }
 
 cmd_run() {
-  local usage="usage: ppi run [--runtime <name>] <alias> <command> [args...]" runtime=""
-  if [ "${1:-}" = --runtime ]; then
-    [ $# -ge 2 ] || die "$usage"
-    runtime=$2
-    valid_name runtime "$runtime"
-    shift 2
-  fi
+  local usage="usage: ppi run --runtime <name> <alias> <command> [args...]" runtime="" out
+  # Readiness matches the runtime label against the app the agent's status reports; an arm
+  # without one could never be delivered to.
+  if [ "${1:-}" != --runtime ] || [ $# -lt 2 ]; then die "$usage"; fi
+  runtime=$2
+  valid_name runtime "$runtime"
+  shift 2
   [ $# -ge 2 ] || die "$usage"
   local alias=$1
   shift
@@ -162,10 +566,17 @@ cmd_run() {
   [ "$alias" != operator ] || die "'operator' is reserved for the console"
   init_home
   [ -n "${REX_BLOCK:-}" ] || die "REX_BLOCK unset; run this inside a Rex pane"
+  lock "$alias"
   echo "$REX_BLOCK" > "$PPI_HOME/panes/$alias"
-  # Undeliverable until the agent is at its prompt; a SessionStart hook or /release marks it idle.
-  set_state "$alias" starting
-  : > "$PPI_HOME/queue/$alias"
+  # A new registration starts unvalidated under a new session generation, so no earlier harness
+  # session's evidence or attempt carries over. Queued messages stay; a message id is never dropped.
+  out=$(alias_jq "$alias" '{session: null, runtime: $runtime, hr: now, since: latest_seq, gen: ((.session.gen // 0) + 1)}' \
+    --arg runtime "$runtime")
+  printf '%s\n' "$out" | put "$PPI_HOME/session/$alias"
+  rm -f "$PPI_HOME/ready/$alias"
+  [ -e "$PPI_HOME/queue/$alias" ] || : > "$PPI_HOME/queue/$alias"
+  # exec skips the EXIT trap.
+  unlock
   # Hooks run the binary that started their pane, so an installed plugin needs no copy of it.
   export PPI_ALIAS=$alias PPI_HOME PPI_BIN=$SELF PPI_RUNTIME=$runtime PATH="$BIN_DIR:$PATH"
   exec "$@"
@@ -186,72 +597,39 @@ cmd_send() {
   valid_name participant "$to"
   valid_name participant "$from"
   init_home
-  id=$(printf '%04x' "$RANDOM")
-  # Serialize counting and queueing across recipients; hooks only take participant locks.
+  local rc=0
+  if [ "$to" != operator ]; then
+    registered "$to"
+    # Refuse before queueing, so a failed send leaves nothing behind for a retry to duplicate.
+    # A sender that cannot reach Rex (rc 2) queues; the dispatcher fails the message later if the block is gone.
+    check_pane "$to" || rc=$?
+    if [ "$rc" -eq 1 ]; then
+      log "$from" "$to" failed "$msg ($CHECK_ERR)"
+      die "not sent: $CHECK_ERR"
+    fi
+  fi
+  # Serialize counting, ids, and queueing across recipients; hooks only take participant locks.
   lock .turns
   if [ "$from" = operator ]; then echo 0 > "$PPI_HOME/turns"; fi
   if [ "$to" = operator ]; then
+    id=$(next_id)
     log "$from" operator delivered "$msg" "$id"
     echo "ppi: delivered to operator"
     unlock
     return
   fi
-  [ -f "$PPI_HOME/panes/$to" ] || die "unknown participant '$to' (known: $(known))"
   count=$(turn_count)
   if [ "$from" != operator ] && [ "$count" -ge 20 ]; then
-    log "$from" "$to" blocked "$msg" "$id"
+    log "$from" "$to" blocked "$msg"
     die 'agent-to-agent turn limit reached (20/20); message the operator instead: ppi send operator "<message>"'
   fi
+  id=$(next_id)
   lock "$to"
-  local rc=0
-  if [ "$(state_of "$to")" = idle ]; then check_pane "$to" || rc=$?; fi
-  # Refuse before queueing, so a failed send leaves nothing behind for a retry to duplicate.
-  if [ "$rc" -eq 1 ]; then
-    log "$from" "$to" failed "$msg ($CHECK_ERR)" "$id"
-    die "not sent: $CHECK_ERR"
-  fi
   if [ "$from" != operator ]; then echo $((count + 1)) > "$PPI_HOME/turns"; fi
-  jq -cn --arg id "$id" --arg from "$from" --arg msg "$msg" '{id: $id, from: $from, msg: $msg}' \
-    >> "$PPI_HOME/queue/$to"
-  if [ "$rc" -eq 2 ]; then
-    log "$from" "$to" pending "$msg" "$id"
-    echo "ppi: queued for $to; the ppi monitor will deliver it (this process cannot reach Rex)"
-  elif [ "$(state_of "$to")" = idle ]; then
-    drain "$to" inject || die "not delivered, left queued: $CHECK_ERR"
-    echo "ppi: delivered to $to"
-  else
-    log "$from" "$to" queued "$msg" "$id"
-    echo "ppi: queued for $to (state: $(state_of "$to")); delivered when it is next idle"
-  fi
+  append "$PPI_HOME/queue/$to" "$(jq -cn --argjson id "$id" --arg from "$from" --arg msg "$msg" '{id: $id, from: $from, msg: $msg}')"
+  log "$from" "$to" queued "$msg" "$id"
   unlock
-}
-
-cmd_release() {
-  [ $# -eq 1 ] || die "usage: ppi release <alias>"
-  valid_name participant "$1"
-  init_home
-  [ -f "$PPI_HOME/panes/$1" ] || die "unknown participant '$1' (known: $(known))"
-  lock "$1"
-  if queued "$1"; then
-    drain "$1" inject || die "$CHECK_ERR; messages stay queued"
-    echo "ppi: delivered queued messages to $1"
-  else
-    set_state "$1" idle
-    echo "ppi: $1 marked idle"
-  fi
-  unlock
-}
-
-cmd_deliver() {
-  [ $# -eq 1 ] || die "usage: ppi deliver <alias>"
-  valid_name participant "$1"
-  init_home
-  [ -f "$PPI_HOME/panes/$1" ] || die "unknown participant '$1' (known: $(known))"
-  lock "$1"
-  if [ "$(state_of "$1")" = idle ] && ! drain "$1" inject; then
-    log ppi "$1" failed "$CHECK_ERR; messages stay queued" ""
-  fi
-  unlock
+  echo "ppi: queued for $to"
 }
 
 cmd_who() {
@@ -263,27 +641,49 @@ cmd_who() {
   printf 'agent-to-agent sends: %s/20\n' "$count"
   for f in "$PPI_HOME"/panes/*; do
     [ -e "$f" ] || continue
-    alias=$(basename "$f")
-    printf '%-10s pane=%-4s state=%-9s queued=%s\n' "$alias" "$(cat "$f")" "$(state_of "$alias")" \
-      "$(wc -l < "$PPI_HOME/queue/$alias" | tr -d ' ')"
+    alias=${f##*/}
+    read_rex "$(cat "$f")"
+    SNAP_STATUS=$REX_STATUS SNAP_PROCESS=$REX_PROCESS SNAP_REACH=$REX_REACH
+    alias_jq "$alias" who_line -r
   done
+  if [ -f "$PPI_HOME/dispatcher.lock/owner" ]; then
+    printf 'dispatcher: block=%s heartbeat=%s\n' "$(jq -r '.block // "unknown"' "$PPI_HOME/dispatcher.lock/owner" 2>/dev/null || echo unknown)" \
+      "$(perl -e '@s = stat shift; print @s ? int(time - $s[9]) . "s ago" : "none"' "$PPI_HOME/heartbeat")"
+  else
+    echo "dispatcher: not running"
+  fi
   # An agent polling for its own reply cannot receive it mid-turn; say so where it is looking.
   if [ -n "${PPI_ALIAS:-}" ] && queued "$PPI_ALIAS"; then
     echo "ppi: messages queued for $PPI_ALIAS (you) arrive only after you stop; finish your response now instead of waiting."
   fi
 }
 
-cmd_monitor() {
+# The operator has returned the agent to its prompt and cleared any partial input. Snapshot,
+# read Rex outside the lock, then confirm only if nothing changed in between.
+cmd_ready() {
+  [ $# -eq 1 ] || die "usage: ppi ready <alias>"
+  local a=$1 snap out
+  valid_name participant "$a"
   init_home
-  echo "ppi bus: $PPI_HOME/bus.jsonl"
-  local line to
-  tail -n +1 -F "$PPI_HOME/bus.jsonl" | while IFS= read -r line; do
-    jq -R -r 'fromjson? | ({delivered: "32", queued: "33", pending: "33", failed: "31", blocked: "31"}[.status] // "0") as $c
-      | "\(.ts) \(.from) → \(.to) \u001b[\($c)m\(.status)\u001b[0m \(.msg)"' <<<"$line"
-    # Senders that cannot reach the multiplexer leave messages pending; this pane runs outside their sandbox.
-    to=$(jq -R -r 'fromjson? | select(.status == "pending") | .to' <<<"$line")
-    [ -z "$to" ] || "$SELF" deliver "$to" || true
-  done
+  registered "$a"
+  lock "$a"
+  snap=$(alias_jq "$a" ready_snapshot)
+  unlock
+  read_rex "$(cat "$PPI_HOME/panes/$a")"
+  case $REX_REACH in
+    ok) SNAP_STATUS=$REX_STATUS SNAP_PROCESS=$REX_PROCESS SNAP_REACH=ok ;;
+    gone) die "not confirmed: $a's pane is gone" ;;
+    *) die "not confirmed: cannot read $a's status from Rex" ;;
+  esac
+  lock "$a"
+  out=$(alias_jq "$a" 'confirm($snap)' --argjson snap "$snap")
+  apply "$out"
+  unlock
+  case $(jq -r .out.result <<<"$out") in
+    ok) echo "ppi: $a confirmed at its prompt; delivery may resume" ;;
+    changed) die "not confirmed: $a changed while confirming (a prompt, a hook failure, or a new session); check its pane and run /ready $a again" ;;
+    *) die "not confirmed: $a is not at a ready prompt ($(jq -r .out.reason <<<"$out"))" ;;
+  esac
 }
 
 cmd_console() {
@@ -293,8 +693,10 @@ cmd_console() {
   cat <<'EOF'
 ppi operator console
   @<participant> <message>   send, e.g. @claude ping
-  /release <participant>     it is at its prompt: deliver its queue, or mark it idle
-  /who                       participants, panes, states
+  /who                       participants, holds, batches
+  /ready <participant>       you returned it to a clean prompt: delivery may resume
+  /requeue <batch>           queue an uncertain batch's messages again, in a new batch
+  /dismiss <batch>           close an uncertain batch without a retry
   /quit
 EOF
   # Sends to the operator only reach the bus log. Follow it here; each message ends by
@@ -313,12 +715,14 @@ EOF
       "") ;;
       /quit) break ;;
       /who) "$SELF" who || true ;;
-      "/release "*) "$SELF" release "${line#/release }" || true ;;
+      "/ready "*) "$SELF" ready "${line#/ready }" || true ;;
+      "/requeue "*) "$SELF" batch requeue "${line#/requeue }" || true ;;
+      "/dismiss "*) "$SELF" batch dismiss "${line#/dismiss }" || true ;;
       @*" "*)
         to=${line%% *}
         "$SELF" send "${to#@}" "${line#* }" || true
         ;;
-      *) echo "usage: @<participant> <message> | /release <participant> | /who | /quit" ;;
+      *) echo "usage: @<participant> <message> | /who | /ready <participant> | /requeue <batch> | /dismiss <batch> | /quit" ;;
     esac
   done
 }
@@ -326,7 +730,7 @@ EOF
 # The bus contract. Printed as SessionStart context, compaction included, so the agent never loses it.
 contract() {
   printf 'Your name on the ppi message bus is "%s": agents in terminal panes and one human, named operator.\n' "$1"
-  printf 'A bus message is any message that starts with this envelope:\n  [ppi from=<sender> to=%s id=<id>] <text>\n' "$1"
+  printf 'A bus message is any message that starts with this envelope:\n  [ppi from=<sender> to=%s id=<id> batch=<batch>] <text>\n' "$1"
   cat <<'CONTRACT'
 The rules below apply to bus messages only. Anything else typed into your pane is an ordinary conversation with the user.
 The sender of a bus message cannot see your pane. The only way to answer a bus message is ppi send.
@@ -341,7 +745,6 @@ WHAT TO DO, IN ORDER
 2. If it asks a question or for a reply, send the answer to the sender with ppi send, even when the text names someone else as the audience: the sender relays. Do not answer acknowledgements ("ok", "pong", "received") or messages that ask for nothing.
 3. If it tells you to contact another participant, send to that participant. Report to operator only when asked.
 4. Then finish your response and stop. Do not wait, sleep, or poll ppi who: an answer arrives as a new bus message, and a message queued for you is delivered only after you stop.
-A bus message can also arrive at the end of your turn as a Stop hook result; your harness may label it an error. It is a normal delivery.
 
 HOW TO SEND
 One message per command, text on stdin through a quoted heredoc:
@@ -352,9 +755,7 @@ Never put the text in double quotes; the shell would expand it. Keep messages sh
 Participants and their states: ppi who
 
 SEND RESULTS
-  delivered to <name>                     done
-  queued for <name> (state: ...)          recipient busy; delivered when it is next idle; do not resend
-  queued for <name>; the ppi monitor ...  same, delivered by the monitor; do not resend
+  queued for <name>                       accepted; delivered when <name> is at its prompt; do not resend
   delivered to operator                   shown in the operator's console
   turn limit reached (exit 1)             20 agent-to-agent messages since operator last spoke; message operator instead
   not sent: ... is not running (exit 1)   recipient has exited; tell operator if it matters
@@ -398,7 +799,8 @@ read_config() {
       jq -e '.command | type == "array" and length > 0 and all(.[]; type == "string")' <<<"$arm" >/dev/null \
         || die "$file: arm '$name': command must be a non-empty array of strings"
       [ -z "$model$profile" ] || die "$file: arm '$name': model and profile belong to runtime presets; put them in command"
-      [ -z "$runtime" ] || valid_name runtime "$runtime"
+      [ -n "$runtime" ] || die "$file: arm '$name': a command arm needs a runtime: claude, codex, or the app its status reports"
+      valid_name runtime "$runtime"
     else
       case $runtime in
         claude)
@@ -426,9 +828,7 @@ arm_argv() {
   runtime=$(jq -r '.runtime // ""' <<<"$arm")
   model=$(jq -r '.model // ""' <<<"$arm")
   profile=$(jq -r '.profile // ""' <<<"$arm")
-  argv=(run)
-  [ -z "$runtime" ] || argv+=(--runtime "$runtime")
-  argv+=("$name")
+  argv=(run --runtime "$runtime" "$name")
   if jq -e 'has("command")' <<<"$arm" >/dev/null; then
     while IFS= read -r -d '' a; do argv+=("$a"); done < <(jq -j '.command[] | . + "\u0000"' <<<"$arm")
     return
@@ -437,6 +837,8 @@ arm_argv() {
     claude)
       argv+=(claude)
       [ -z "$model" ] || argv+=(--model "$model")
+      # The startup prompt's prompt-and-Stop pair validates the arm before any delivery.
+      argv+=("$STARTUP_PROMPT")
       ;;
     codex)
       argv+=(codex)
@@ -455,7 +857,131 @@ json_array() {
   printf '%s\n' "$out"
 }
 
-# The agents go side by side above this pane, the bus monitor gets its own tab, and this pane
+owns_dispatcher() { [ "$(jq -r '.pid // ""' "$PPI_HOME/dispatcher.lock/owner" 2>/dev/null)" = "$$" ]; }
+
+# Stop the reader a dispatcher lock records. Its pid may since belong to another process, even
+# another reader of this bus, so the start time recorded with it must match too.
+stop_reader() { # lock dir
+  local pid start now
+  pid=$(jq -r '.pid // ""' "$1/reader" 2>/dev/null) || return 0
+  start=$(jq -r '.start // ""' "$1/reader" 2>/dev/null) || return 0
+  case $pid in "" | *[!0-9]*) return 0 ;; esac
+  read -r now < <(ps -o lstart= -p "$pid" 2>/dev/null) || return 0
+  [ -n "$start" ] && [ "$now" = "$start" ] || return 0
+  kill "$pid" 2>/dev/null || true
+  rm -f "$1/reader"
+}
+
+# Take the dispatcher lock, replacing an owner whose block is gone or whose program has exited.
+# Anything less certain refuses and leaves the lock: a pid mismatch or an old heartbeat proves nothing,
+# and an owner in another Rex session cannot be checked from this one, where its block looks missing.
+# .dispatch serializes this with every owner's cleanup, so a cleanup never removes its replacement.
+claim_dispatcher() {
+  local d=$PPI_HOME/dispatcher.lock owner opid oblock osession out rc=0 state
+  lock .dispatch
+  if ! mkdir "$d" 2>/dev/null; then
+    owner=$(cat "$d/owner" 2>/dev/null) || owner=""
+    opid=$(jq -r '.pid // ""' <<<"$owner" 2>/dev/null) || opid=""
+    oblock=$(jq -r '.block // ""' <<<"$owner" 2>/dev/null) || oblock=""
+    osession=$(jq -r '.session // ""' <<<"$owner" 2>/dev/null) || osession=""
+    case $opid in "" | *[!0-9]*) die "the dispatcher lock has no complete owner record: $d (remove it if no dispatcher runs)" ;; esac
+    [ -n "$oblock" ] && [ -n "$osession" ] || die "the dispatcher lock has no complete owner record: $d (remove it if no dispatcher runs)"
+    [ "$osession" = "$REX_SESSION" ] \
+      || die "the dispatcher lock belongs to Rex session $osession, where this pane cannot check it; the lock stays"
+    # The API, not block call: the CLI exits 3 for a malformed id too, and only a confirmed not_found
+    # proves the block gone, the rule the dispatcher's own reads follow.
+    out=$(jq -cn --arg b "$oblock" '{block_id: $b, args: {}}' \
+      | rx api call -s "$REX_SESSION" com.superlogical.terminal.process - 2>&1) || rc=$?
+    case $rc in
+      0) state=$(jq -r --argjson pid "$opid" \
+           'if .last_exit != null then "exited" elif .child.pid == $pid then "live" else "other" end' <<<"$out" 2>/dev/null) || state="" ;;
+      3) case $out in *"code=not_found"*) state=gone ;; *) state="" ;; esac ;;
+      *) state="" ;;
+    esac
+    case $state in
+      live) die "a dispatcher is already running in $oblock" ;;
+      gone | exited)
+        stop_reader "$d"
+        rm -rf "$d"
+        mkdir "$d"
+        echo "ppi: replacing the dispatcher of $oblock (its $([ "$state" = gone ] && echo block is gone || echo program exited))"
+        ;;
+      other) die "the dispatcher lock names pid $opid in $oblock, which runs another program; the lock stays" ;;
+      *) die "cannot check the dispatcher in $oblock (${out:-no answer}); the lock stays" ;;
+    esac
+  fi
+  jq -cn --argjson pid "$$" --arg block "$REX_BLOCK" --arg session "$REX_SESSION" \
+    '{pid: $pid, block: $block, session: $session, hr: now}' | put "$d/owner"
+  unlock
+}
+
+# After the script ends: stop its reader, which a SIGKILLed script leaves running.
+stop_own_reader() {
+  lock_try .dispatch 5 || return 0
+  if owns_dispatcher; then stop_reader "$PPI_HOME/dispatcher.lock"; fi
+  unlock
+}
+
+release_dispatcher() {
+  if [ -n "$DISPATCH_CHILD" ]; then
+    kill -TERM "$DISPATCH_CHILD" 2>/dev/null || true
+    wait "$DISPATCH_CHILD" 2>/dev/null || true
+  fi
+  if lock_try .dispatch 5 && owns_dispatcher; then
+    stop_reader "$PPI_HOME/dispatcher.lock"
+    rm -rf "$PPI_HOME/dispatcher.lock"
+  fi
+  unlock
+}
+
+# The bus's one delivery mechanism: this supervisor owns the dispatcher lock and runs
+# lib/dispatch.lua under rex do, restarting it when it fails. It must be its pane's own program,
+# since owner liveness is that pane's process; a supervisor nested in a shell could not be checked.
+cmd_dispatch() {
+  [ $# -eq 0 ] || die "usage: ppi dispatch"
+  local lib proc rc now t n recent="" kept
+  init_home
+  [ -n "${REX_BLOCK:-}" ] || die "REX_BLOCK unset; run ppi dispatch as a Rex pane's program"
+  lib=$BIN_DIR/../lib/dispatch.lua
+  [ -f "$lib" ] || die "dispatcher script not found: $lib"
+  proc=$(rx block call -s "$REX_SESSION" -b "$REX_BLOCK" process) || die "cannot read this pane's process from Rex"
+  [ "$(jq -r '.child.pid // ""' <<<"$proc")" = "$$" ] \
+    || die "ppi dispatch must be its pane's own program, not a command run from the pane's shell"
+  claim_dispatcher
+  DISPATCH_STOP=0 DISPATCH_CHILD=""
+  trap 'DISPATCH_STOP=1; [ -z "$DISPATCH_CHILD" ] || kill -TERM "$DISPATCH_CHILD" 2>/dev/null || true' TERM INT HUP
+  trap release_dispatcher EXIT
+  echo "ppi dispatcher: bus $PPI_HOME; Ctrl-C stops it"
+  while [ "$DISPATCH_STOP" -eq 0 ]; do
+    # The binary, not rx: $! must be rex itself for TERM to reach it.
+    "${REX_BIN_DIR:+$REX_BIN_DIR/}rex" --autostart=false --timeout 3s "do" --fail-fast -s "$REX_SESSION" "$lib" \
+      --args "$(jq -cn --arg ppi "$SELF" --arg bash "$BASH" --arg home "$PPI_HOME" '{ppi: $ppi, bash: $bash, home: $home}')" &
+    DISPATCH_CHILD=$!
+    rc=0
+    wait "$DISPATCH_CHILD" || rc=$?
+    # A trapped signal ends wait before the child has.
+    while kill -0 "$DISPATCH_CHILD" 2>/dev/null; do
+      rc=0
+      wait "$DISPATCH_CHILD" || rc=$?
+    done
+    DISPATCH_CHILD=""
+    [ "$DISPATCH_STOP" -eq 0 ] && [ "$rc" -ne 0 ] || break
+    stop_own_reader
+    now=$(date +%s) kept="" n=0
+    for t in $recent; do
+      if [ $((now - t)) -lt 60 ]; then kept="$kept $t" n=$((n + 1)); fi
+    done
+    if [ "$n" -ge 5 ]; then
+      echo "ppi: the dispatcher failed (status $rc) after 5 restarts within a minute; stopped" >&2
+      exit 1
+    fi
+    recent="$kept $now"
+    echo "ppi: the dispatcher exited with status $rc; restarting in 1 s" >&2
+    sleep 1
+  done
+}
+
+# The agents go side by side above this pane, the dispatcher gets its own tab, and this pane
 # runs the console. /quit returns to the shell; the agents keep running, and ppi console rejoins.
 cmd_up() {
   [ $# -le 1 ] || die "usage: ppi up [config]"
@@ -495,55 +1021,40 @@ cmd_up() {
     '{anchor_id: $anchor, direction: "vertical", side: "before", ratio: 0.7, layout: $layout}' \
     | rx --timeout 15s api call -s "$REX_SESSION" session.new_split - >/dev/null \
     || die "could not start the agents"
-  jq -cn --arg cwd "$PWD" --argjson path "$path" --argjson command "$(json_array env "${envs[@]}" "$SELF" monitor)" \
+  # The dispatcher is the tab's own program, and its last lines stay on screen after it stops.
+  jq -cn --arg cwd "$PWD" --argjson path "$path" --argjson command "$(json_array env "${envs[@]}" "$SELF" dispatch)" \
     '{window_label: "ppi bus", focus: false,
       layout: {block: {flavor: "com.superlogical.terminal.shell",
-        options: {command: $command, cwd: $cwd, path_prepend: $path}}}}' \
+        options: {command: $command, cwd: $cwd, path_prepend: $path, exit: {on_completion: false}}}}}' \
     | rx --timeout 15s api call -s "$REX_SESSION" session.new_window - >/dev/null \
-    || die "the agents started, but the bus monitor tab did not; run ppi monitor in another tab"
+    || die "the agents started, but the dispatcher tab did not; nothing is delivered until ppi dispatch runs as a tab's own program"
   cmd_console
 }
 
+# Hooks observe; they never deliver. A harness shows a hook's output and failures, so this prints
+# nothing but the SessionStart contract and always exits 0; a failed observation becomes a hold.
 cmd_hook() {
-  local alias=${PPI_ALIAS:-} input source
+  local alias=${PPI_ALIAS:-} event=${1:-} input err rc
   # Not launched through 'ppi run': stay out of the way.
   [ -n "$alias" ] || exit 0
   input=$(cat)
-  init_home
-  case ${1:-} in
-    session-start)
-      source=$(jq -r '.source // ""' <<<"$input" 2>/dev/null || true)
-      # Auto-compaction can run mid-turn; only a started, resumed, or cleared session is at its prompt.
-      if [ "$source" != compact ]; then
-        lock "$alias"
-        set_state "$alias" idle
-        unlock
-      fi
-      # Claude's Bash tool runs from a shell snapshot, so the env set by 'ppi run' may not reach it.
-      if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
-        printf 'export PATH=%q:"$PATH"\nexport PPI_ALIAS=%q PPI_HOME=%q\n' \
-          "$BIN_DIR" "$alias" "$PPI_HOME" >> "$CLAUDE_ENV_FILE"
-      fi
-      contract "$alias"
-      ;;
-    prompt)
-      lock "$alias"
-      set_state "$alias" busy
-      unlock
-      ;;
-    stop)
-      lock "$alias"
-      if queued "$alias"; then drain "$alias" stop; else set_state "$alias" idle; fi
-      unlock
-      ;;
-    idle)
-      lock "$alias"
-      set_state "$alias" idle
-      drain "$alias" inject || true
-      unlock
-      ;;
-    *) die "unknown hook '${1:-}'" ;;
-  esac
+  bus_home || exit 0
+  if [ "$event" = session-start ]; then
+    # Claude's Bash tool runs from a shell snapshot, so the env set by 'ppi run' may not reach it.
+    if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
+      printf 'export PATH=%q:"$PATH"\nexport PPI_ALIAS=%q PPI_HOME=%q\n' \
+        "$BIN_DIR" "$alias" "$PPI_HOME" >> "$CLAUDE_ENV_FILE" || true
+    fi
+    contract "$alias"
+  fi
+  case $event in session-start | prompt | stop | interrupt) ;; *) exit 0 ;; esac
+  # errexit holds inside this subshell only because it is not part of a condition.
+  set +e
+  err=$( (set -e; trap unlock EXIT; observe "$event" "$input") 2>&1 >/dev/null)
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || publish_failure "$alias" "$event" "$input" "${err:-exit status $rc}" >/dev/null 2>&1 || true
+  exit 0
 }
 
 cmd=${1:-}
@@ -551,15 +1062,15 @@ shift $(($# > 0 ? 1 : 0))
 case $cmd in
   run) cmd_run "$@" ;;
   send) cmd_send "$@" ;;
-  release) cmd_release "$@" ;;
-  deliver) cmd_deliver "$@" ;;
   who) cmd_who ;;
-  monitor) cmd_monitor ;;
+  ready) cmd_ready "$@" ;;
+  batch) cmd_batch "$@" ;;
   console) cmd_console ;;
   up) cmd_up "$@" ;;
+  dispatch) cmd_dispatch "$@" ;;
   hook) cmd_hook "$@" ;;
   *)
-    sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 1
     ;;
 esac
