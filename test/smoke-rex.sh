@@ -556,6 +556,9 @@ check "reordered, partial, altered, quoted, or old batch text never binds" batch
 check "no such prompt observation names the batch" quiet_jq -se --argjson b "$B2" 'all(.[]; .batch != $b)' "$SYN/prompts/sa"
 check "an unrelated prompt makes the outstanding attempt uncertain" \
   batch_is "$B2" '"\(.disposition) \(.reason)"' "uncertain intervening"
+check "who says the unrelated prompt came while the unobserved batch was unresolved" grep -qx \
+  "  batch $B2: another prompt reached sa while this batch was unresolved (prompt 3); /requeue $B2 or /dismiss $B2" \
+  <<<"$(syn "$PPI" who)"
 shook sa stop "$(stop_in S1 Q1)"
 check "a Stop for the unrelated prompt does not release it" batch_is "$B2" .disposition uncertain
 check "check on an uncertain attempt is stale, so nothing is sent" result_is "$(scheck "$B2")" stale
@@ -715,6 +718,28 @@ fix_status idle
 who_out=$(syn "$PPI" who)
 check "who shows validation, state, queue, hold, and the outstanding batch" \
   grep -qx "sc block=block:sc validated state=idle queued=0 hold=outstanding $BC batch=$BC observed/uncertain interrupted" <<<"$who_out"
+check "who explains the uncertain batch and how to resolve it" \
+  grep -qx "  batch $BC: the turn was interrupted; /requeue $BC or /dismiss $BC" <<<"$who_out"
+check "an agent's who gives the cause without the operator's commands" \
+  grep -qx "  batch $BC: the turn was interrupted" <<<"$(syn env PPI_ALIAS=sa "$PPI" who)"
+# An unrelated prompt after the observation, before its Stop, leaves an observed batch unresolved too.
+syn env REX_BLOCK=block:so "$PPI" run --runtime claude so true
+shook so session-start '{"session_id":"O1","source":"startup"}' >/dev/null
+shook so prompt "$(prompt_in O1 O0 "Startup check")"
+shook so stop "$(stop_in O1 O0)"
+ssend operator so "observed, then another prompt"
+out=$(stick so)
+BO=$(jq -r .batch <<<"$out")
+syn "$PPI" batch submitted "$BO" >/dev/null
+shook so prompt "$(prompt_in O1 O1 "$(jq -r .text <<<"$out")")"
+shook so prompt "$(prompt_in O1 O2 "an unrelated prompt")"
+check "an unrelated prompt after the observation makes the attempt uncertain" \
+  batch_is "$BO" '"\(.evidence)/\(.disposition) \(.reason) \(.detail)"' "observed/uncertain intervening prompt 3"
+check "who does not claim the unrelated prompt came before the observed batch" grep -qx \
+  "  batch $BO: another prompt reached so while this batch was unresolved (prompt 3); /requeue $BO or /dismiss $BO" \
+  <<<"$(syn "$PPI" who)"
+check "the uncertain transition's bus line carries its reason" quiet_jq -se --argjson b "$BC" \
+  'any(.[]; .batch == $b and .status == "uncertain" and .reason == "interrupted" and .detail == null)' "$SYN/bus.jsonl"
 check "who reports the dispatcher" grep -qx "dispatcher: not running" <<<"$who_out"
 
 # Session scoping of failure holds.
@@ -750,9 +775,13 @@ check "a cancelled prompt holds the arm" hold_is "$(stick sd)" no-stop
 syn "$PPI" ready sd >/dev/null
 # The racing attempt is reserved and already uncertain when /ready confirms, so only the snapshot sees it.
 racing "b=\$(\"$PPI\" batch tick sd --status '$(cat "$STUB/status.json")' --process '$(cat "$STUB/process.json")' | jq -r .batch)
-\"$PPI\" batch uncertain \"\$b\" transport"
+\"$PPI\" batch uncertain \"\$b\" transport 'paste: refused'"
 check "/ready refuses when an attempt is reserved while it reads" fails_with syn "$PPI" ready sd
 bd=$(newest_batch sd)
+check "a transport failure records the dispatcher's message as its detail" \
+  batch_is "$bd" '"\(.reason) \(.detail)"' "transport paste: refused"
+check "who names the failed step" grep -qx "  batch $bd: the paste or Enter failed (paste: refused); /requeue $bd or /dismiss $bd" \
+  <<<"$(syn "$PPI" who)"
 check "the racing attempt consumed the earlier baseline" [ ! -e "$SYN/ready/sd" ]
 check "the racing attempt is uncertain (precondition)" batch_is "$bd" .disposition uncertain
 syn "$PPI" batch requeue "$bd" >/dev/null
@@ -842,7 +871,7 @@ cat > "$STANDIN" <<'EOF'
 # prompt. It reports status as its runtime label and calls the ppi hooks with Claude's fields.
 # A marker in the prompt picks a variant: standin:blocked (no Stop, then done), standin:cancel
 # (no Stop, then idle), standin:exit (clear, exit 0), standin:missed (the prompt hook runs while
-# its lock is held past the deadline, then done), and standin:busy-on-paste, which reports working
+# its lock is held past the deadline, then done), standin:busy-on-paste, which reports working
 # as soon as the paste closes, before any Enter.
 # Ctrl-D at its prompt quits and leaves the last status, as a harness quitting at its prompt does.
 export LC_ALL=C
@@ -1031,13 +1060,26 @@ dppi ready si >/dev/null
 check "/ready lifts the hold after a cancelled direct prompt" \
   eventually latest_is si '"\([.messages[].msg] | join(",")) \(.disposition)"' "after the cancel released"
 
+# An operator console on this bus explains a batch the moment it turns uncertain.
+mkfifo "$TMP/dconsole.in"
+env PPI_HOME="$DH" "$PPI" console <"$TMP/dconsole.in" >"$TMP/dconsole.out" 2>&1 &
+dconsole_pid=$!
+exec 8>"$TMP/dconsole.in"
+sleep 0.5
 dsend si "standin:blocked"
 check "a blocked prompt makes its batch uncertain no-stop" eventually latest_is si '"\(.disposition) \(.reason)"' "uncertain no-stop"
 BB=$(batch_for si)
+check "the console explains the uncertain batch as it happens" eventually_in "$TMP/dconsole.out" \
+  "^\[ppi\] batch $BB to si is uncertain: si went back to its prompt with no Stop for this batch, as after a blocked or cancelled prompt\. Inspect si, then /requeue $BB to send it again or /dismiss $BB to drop it\.$"
+echo /quit >&8
+exec 8>&-
+wait "$dconsole_pid" || true
 dsend si "after the block"
 sleep 1.5
 check "nothing goes out while a batch is uncertain" queued_count si 1
-dppi batch dismiss "$BB" >/dev/null
+out=$(dppi batch dismiss "$BB")
+check "/dismiss says the arm still needs /ready" grep -qx \
+  "ppi: si is still held (no-stop): once it is back at a clean prompt with no partial input, /ready si" <<<"$out"
 sleep 1.5
 check "after /dismiss the arm still holds for the missing Stop" queued_count si 1
 dppi ready si >/dev/null
@@ -1123,8 +1165,12 @@ check "the successor still owns the lock, with a live reader" owned_with_reader 
 check "the closed owner's reader is stopped" eventually gone_pid "$R4"
 
 # A tick that fails after writing its reservation: the script ends, and the restart holds the attempt.
+# Closing the old owner above can kill a ppi call that holds a lock, which then fails every restart.
+no_locks() { [ -z "$(ls -A "$DH/locks")" ]; }
+check "the closed owner left no lock behind (precondition)" eventually no_locks
+no_locks || echo "  left in $DH/locks: $(ls -A "$DH/locks" | tr '\n' ' ')"
 SR=$(pane sr --keep-open -- env PPI_HOME="$DH" "$PPI" run --runtime fake sr "$STANDIN")
-eventually test -e "$DH/standin.sr.ready" || true
+check "the stand-in is at its prompt (precondition)" eventually test -e "$DH/standin.sr.ready"
 dsend sr "into a failed reservation"
 chmod a-w "$DH/queue"
 type_into "$SR" hello
@@ -1137,7 +1183,8 @@ check "the restart holds the attempt whose result never reached the dispatcher" 
 check "the restart repairs the queue: the attempt owns its message" eventually queued_count sr 0
 check "nothing reached the agent" quiet_jq -se 'length == 1' "$DH/standin.sr.prompts"
 check "the restarted dispatcher still owns the lock" owned_with_reader "$DISP5"
-dppi batch requeue "$BR" >/dev/null
+out=$(dppi batch requeue "$BR" 2>&1) || true
+check "/requeue of an arm with nothing else held asks for no /ready" [ "$out" = "ppi: batch $BR requeued" ]
 check "/requeue sends the held message in a new batch" \
   eventually latest_is sr '"\([.messages[].msg] | join(",")) \(.disposition)"' "into a failed reservation released"
 
@@ -1172,5 +1219,38 @@ check "the unpublished reader does not outlive its script" eventually gone_pid "
 check "one reader follows the bus" [ "$(bus_readers | grep -c .)" -eq 1 ]
 kill -TERM "$(owner_pid)"
 eventually exited_but_open "$DISP6" || true
+
+# A delivery step that fails inside the dispatcher: under a dispatcher whose PATH finds it first, a jq
+# fails the first pre-input check once, and the dispatcher holds the batch with the check's error.
+mkdir "$TMP/failjq"
+cat > "$TMP/failjq/jq" <<EOF
+#!/bin/sh
+for a in "\$@"; do last=\$a; done
+case \$last in
+  *'check(\$b)') if [ -e "$TMP/failjq.once" ]; then rm -f "$TMP/failjq.once"; echo "jq: injected failure" >&2; exit 5; fi ;;
+esac
+exec $(command -v jq) "\$@"
+EOF
+chmod +x "$TMP/failjq/jq"
+SL=$(pane sl --keep-open -- env PPI_HOME="$DH" "$PPI" run --runtime fake sl "$STANDIN")
+check "a fresh stand-in is at its prompt (precondition)" eventually test -e "$DH/standin.sl.ready"
+type_into "$SL" hello
+check "it validates on a typed prompt (precondition)" eventually test -s "$DH/stops/sl"
+DISP7=$(pane bus7 --keep-open -- env PATH="$TMP/failjq:$PATH" PPI_HOME="$DH" "$PPI" dispatch)
+check "the dispatcher with the failing jq runs (precondition)" eventually owner_is "$DISP7"
+touch "$TMP/failjq.once"
+dsend sl "into a failing check"
+injected="ppi batch check: jq: injected failure"
+check "a check that fails inside the dispatcher holds the batch with its error as the detail" \
+  eventually latest_is sl '"\(.disposition) \(.reason) \(.detail)"' "uncertain error $injected"
+BL=$(batch_for sl)
+check "its bus line carries the reason and the dispatcher's error" quiet_jq -se --argjson b "$BL" --arg d "$injected" \
+  'any(.[]; .batch == $b and .status == "uncertain" and .reason == "error" and .detail == $d)' "$DH/bus.jsonl"
+check "who renders the dispatcher's error in the cause" grep -qxF \
+  "  batch $BL: a queue operation failed during delivery ($injected); /requeue $BL or /dismiss $BL" <<<"$(dppi who)"
+check "nothing went out after the failed check" quiet_jq -se --argjson b "$BL" \
+  'all(.[]; .batch != $b or .status != "submitted")' "$DH/bus.jsonl"
+kill -TERM "$(owner_pid)"
+eventually exited_but_open "$DISP7" || true
 
 if [ "$fails" -eq 0 ]; then echo "all passed"; else echo "$fails failed"; exit 1; fi

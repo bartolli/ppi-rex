@@ -74,8 +74,8 @@ end
 
 -- The guarded transition for an attempt whose delivery failed. If even that fails, end the script:
 -- restart reconciliation holds the attempt instead.
-local function hold(b, reason)
-  local _, err = ppi("batch", "uncertain", tostring(b), reason)
+local function hold(b, reason, detail)
+  local _, err = ppi("batch", "uncertain", tostring(b), reason, detail)
   if err then fatal(string.format("batch %d left unresolved: %s", b, err)) end
 end
 
@@ -85,9 +85,9 @@ end
 local function step(b, fn)
   local ok, res, msg = pcall(fn)
   if ok and type(res) == "boolean" then return res end
-  local reason = ok and res or "error"
-  say(string.format("batch %d: %s", b, tostring(ok and msg or res)))
-  hold(b, reason)
+  local reason, detail = ok and res or "error", tostring(ok and msg or res)
+  say(string.format("batch %d: %s", b, detail))
+  hold(b, reason, detail)
   return false
 end
 

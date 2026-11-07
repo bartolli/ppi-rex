@@ -169,6 +169,27 @@ def logline($b; $to; $status; $msg):
   {op: "log", path: "", json: {ts: (now | strflocaltime("%H:%M:%S")), batch: $b, from: "ppi", to: $to, status: $status, msg: $msg}};
 def putbatch: {op: "put", path: "batches/\(.id)", json: .};
 def uncertain($reason; $detail): .disposition = "uncertain" | .reason = $reason | .detail = $detail | .hr_uncertain = now;
+# The record of a batch just made uncertain, and its bus line, which carries reason and detail for the console.
+def held:
+  . as $y
+  | [putbatch, (logline(.id; .to; "uncertain"; "\(.reason)\(if .detail then ": \(.detail)" else "" end)")
+                | .json += {reason: $y.reason, detail: $y.detail})];
+def flat: gsub("[\u0000-\u001f\u007f-\u009f]+"; " ");
+def cause:
+  .to as $a | (if .detail then " (\(.detail | flat))" else "" end) as $d
+  | {preempted: "\($a) stopped being ready before input\($d); pasted text may sit in its input",
+     intervening: "another prompt reached \($a) while this batch was unresolved\($d)",
+     registration: "\($a) was registered again during the attempt\($d)",
+     session: "\($a) started a new harness session during the attempt\($d)",
+     "no-observation": "Enter went out, but no prompt hook reported the batch in time",
+     "no-stop": "\($a) went back to its prompt with no Stop for this batch, as after a blocked or cancelled prompt",
+     exited: "\($a) exited during the attempt",
+     closed: "the pane of \($a) closed during the attempt",
+     interrupted: "the turn was interrupted",
+     restart: "the dispatcher restarted during delivery",
+     transport: "the paste or Enter failed\($d)",
+     error: "a queue operation failed during delivery\($d)"}[.reason // ""]
+    // "\(.reason)\($d)";
 
 def current: [.batches[] | select(.disposition == "active" or .disposition == "uncertain")] | first;
 def latest_seq: [.prompts[].seq] | max // 0;
@@ -259,7 +280,7 @@ def tick($counter):
     else
       {out: $act,
        writes: ((if .queue != $before then [{op: "lines", path: "queue/\(.alias)", json: .queue}] else [] end)
-                + (if $why then [($c | uncertain($why; null) | putbatch), logline($c.id; .alias; "uncertain"; $why)] else [] end))}
+                + (if $why then ($c | uncertain($why; null) | held) else [] end))}
     end;
 
 def check($id):
@@ -274,12 +295,16 @@ def check($id):
            elif (holding | length) > 0 then "hook-failure"
            else liveness // status_hold end)) as $why
       | if $why then
-          {out: {result: "preempted", reason: $why},
-           writes: [($x | uncertain("preempted"; $why) | putbatch), logline($id; .alias; "uncertain"; "preempted: \($why)")]}
+          {out: {result: "preempted", reason: $why}, writes: ($x | uncertain("preempted"; $why) | held)}
         else {out: {result: "ok"}, writes: []} end
     end;
 
-def op($id; $op; $reason):
+# Resolving a batch never makes its arm ready: the hold left that only /ready from the operator lifts, if any.
+def needs_ready:
+  if (holding | length) > 0 then "hook-failure"
+  elif .ready != null then null
+  else validation | if . == "no-stop" then . else null end end;
+def op($id; $op; $reason; $detail):
   ([.batches[] | select(.id == $id)] | first) as $x
   | if $x == null then error("no batch \($id) for \(.alias)") else . end
   | (if $op == "submitted" then
@@ -287,7 +312,8 @@ def op($id; $op; $reason):
         then {r: "ok", b: ($x | .evidence |= (if rank < 1 then "submitted" else . end) | .hr_submitted //= now)}
         else {r: "stale"} end)
      elif $op == "uncertain" then
-       (if $x.disposition == "active" then {r: "ok", b: ($x | uncertain($reason; null))} else {r: "stale"} end)
+       (if $x.disposition == "active" then {r: "ok", b: ($x | uncertain($reason; (if $detail == "" then null else $detail end)))}
+        else {r: "stale"} end)
      elif $op == "requeue" then
        (if $x.disposition == "uncertain" then {r: "ok", b: ($x | .disposition = "superseded" | .requeued = true | .hr_resolved = now)}
         elif $x.disposition == "superseded" then {r: "ok"} else {r: "stale"} end)
@@ -297,10 +323,12 @@ def op($id; $op; $reason):
      else error("unknown operation \($op)") end) as $d
   | (.batches |= map(if .id == $id and $d.b != null then $d.b else . end) | reconciled) as $q
   | ($d.b // $x) as $y
-  | {out: {result: $d.r, changed: ($d.b != null), batch: $id, disposition: $y.disposition, evidence: $y.evidence},
-     writes: ((if $d.b then [($d.b | putbatch),
-                             logline($id; .alias; (if $op == "submitted" then "submitted" else $y.disposition end); $reason)]
-               else [] end)
+  | {out: {result: $d.r, changed: ($d.b != null), batch: $id, disposition: $y.disposition, evidence: $y.evidence,
+           ready: (if $op | IN("requeue", "dismiss") then needs_ready else null end)},
+     writes: ((if $d.b == null then []
+               elif $op == "uncertain" then ($d.b | held)
+               else [($d.b | putbatch), logline($id; .alias; (if $op == "submitted" then "submitted" else $y.disposition end); $reason)]
+               end)
               + (if $q != .queue then [{op: "lines", path: "queue/\(.alias)", json: $q}] else [] end)
               + (if $d.r == "stale" then [logline($id; .alias; "late-callback"; "\($op) on \($x.disposition)/\($x.evidence)")]
                  else [] end))};
@@ -313,8 +341,7 @@ def restart:
   | ($c != null and $c.disposition == "active" and ($c.evidence | IN("attempting", "submitted"))) as $held
   | {out: {result: "ok", batch: (if $held then $c.id else null end)},
      writes: ((if .queue != $before then [{op: "lines", path: "queue/\(.alias)", json: .queue}] else [] end)
-              + (if $held then [($c | uncertain("restart"; null) | putbatch), logline($c.id; .alias; "uncertain"; "restart")]
-                 else [] end))};
+              + (if $held then ($c | uncertain("restart"; null) | held) else [] end))};
 
 def on_session($h; $runtime):
   if ($h.session_id // "") == "" then error("SessionStart input has no session_id") else . end
@@ -345,7 +372,7 @@ def on_prompt($h):
              logline($c.id; .alias; "observed"; "prompt \($seq)")]
           elif $c != null and $c.disposition == "active" then
             (unbound($c) // "intervening") as $why
-            | [($c | uncertain($why; "prompt \($seq)") | putbatch), logline($c.id; .alias; "uncertain"; "\($why), prompt \($seq)")]
+            | ($c | uncertain($why; "prompt \($seq)") | held)
           else [] end)
        + [{op: "rm", path: "ready/\(.alias)"}])};
 def on_end($h; $event):
@@ -360,7 +387,7 @@ def on_end($h; $event):
             [($c | .disposition = "released" | .reason = "stop" | .stop_hook_active = $h.stop_hook_active | .hr_released = now | putbatch),
              logline($c.id; .alias; "released"; "stop")]
           elif $mine and $event == "interrupt" then
-            [($c | uncertain("interrupted"; null) | putbatch), logline($c.id; .alias; "uncertain"; "interrupted")]
+            ($c | uncertain("interrupted"; null) | held)
           else
             ([.batches[] | select($pid != "" and .pid == $pid and .session == $s)] | first) as $old
             | if $old then [logline($old.id; .alias; "late-callback"; "\($event) on \($old.disposition)/\($old.evidence)")] else [] end
@@ -385,7 +412,8 @@ def confirm($snap):
       end
     end;
 
-def who_line:
+# Agents run who too; the resolution commands are for the operator alone.
+def who_line($operator):
   (.status | root) as $r | current as $c | readiness as $h
   | [.alias, "block=\(.block)", (if startup_ok then "validated" else "unvalidated" end),
      "state=\(if .reach == "ok" then ($r.state // "none") else "unknown" end)", "queued=\(.queue | length)",
@@ -393,7 +421,10 @@ def who_line:
     + (if $c then ["batch=\($c.id) \($c.evidence)/\($c.disposition)\(if $c.reason then " " + $c.reason else "" end)"] else [] end)
     + (if .ready then ["baseline"] else [] end)
     + (if (.session.session // null) == null then ["no harness session recorded"] else [] end)
-  | join(" ");
+  | join(" ")
+    + (if $c.disposition == "uncertain"
+       then "\n  batch \($c.id): \($c | cause)\(if $operator then "; /requeue \($c.id) or /dismiss \($c.id)" else "" end)"
+       else "" end);
 '
 # The one input every decision reads; it needs alias_jq's named arguments.
 BUS_IN='
@@ -466,7 +497,7 @@ batch_alias() { # batch -> its recipient; to is immutable, so no lock is needed 
 }
 
 cmd_batch() {
-  local usage="usage: ppi batch <tick <alias> [snapshot] | check <batch> [snapshot] | submitted|uncertain <batch> [reason] | requeue|dismiss <batch> | restart <alias>>"
+  local usage="usage: ppi batch <tick <alias> [snapshot] | check <batch> [snapshot] | submitted <batch> | uncertain <batch> <reason> [detail] | requeue|dismiss <batch> | restart <alias>>"
   local sub=${1:-} a out
   [ $# -eq 0 ] || shift
   [ $# -ge 1 ] || die "$usage"
@@ -496,7 +527,7 @@ cmd_batch() {
       a=$(batch_alias "$1")
       [ "$sub" != uncertain ] || [ -n "${2:-}" ] || die "usage: ppi batch uncertain <batch> <reason>"
       lock "$a"
-      out=$(alias_jq "$a" 'op($b; $op; $reason)' --argjson b "$1" --arg op "$sub" --arg reason "${2:-}")
+      out=$(alias_jq "$a" 'op($b; $op; $reason; $detail)' --argjson b "$1" --arg op "$sub" --arg reason "${2:-}" --arg detail "${3:-}")
       ;;
     restart)
       a=$1
@@ -518,6 +549,9 @@ cmd_batch() {
         "ok false") echo "ppi: batch $1 was already $done" ;;
         *) die "batch $1 is not uncertain ($(jq -r '"\(.out.disposition)/\(.out.evidence)"' <<<"$out")); nothing changed" ;;
       esac
+      local held
+      held=$(jq -r '.out.ready // ""' <<<"$out")
+      [ -z "$held" ] || echo "ppi: $a is still held ($held): once it is back at a clean prompt with no partial input, /ready $a"
       ;;
     *) jq -c .out <<<"$out" ;;
   esac
@@ -644,7 +678,8 @@ cmd_send() {
 
 cmd_who() {
   init_home
-  local f alias count
+  local f alias count operator=false
+  [ "${PPI_ALIAS:-operator}" != operator ] || operator=true
   lock .turns
   count=$(turn_count)
   unlock
@@ -654,7 +689,7 @@ cmd_who() {
     alias=${f##*/}
     read_rex "$(cat "$f")"
     SNAP_STATUS=$REX_STATUS SNAP_PROCESS=$REX_PROCESS SNAP_REACH=$REX_REACH
-    alias_jq "$alias" who_line -r
+    alias_jq "$alias" "who_line($operator)" -r
   done
   if [ -f "$PPI_HOME/dispatcher.lock/owner" ]; then
     printf 'dispatcher: block=%s heartbeat=%s\n' "$(jq -r '.block // "unknown"' "$PPI_HOME/dispatcher.lock/owner" 2>/dev/null || echo unknown)" \
@@ -709,14 +744,19 @@ ppi operator console
   /dismiss <batch>           close an uncertain batch without a retry
   /quit
 EOF
-  # Sends to the operator only reach the bus log. Follow it here; each message ends by
-  # reprinting the prompt it interrupted, which keeps readline's cursor column intact.
+  # Sends to the operator only reach the bus log. Follow it here, with every batch that turns
+  # uncertain; each line ends by reprinting the prompt it interrupted, which keeps readline's
+  # cursor column intact.
   # A closed pane kills this process without running traps, so the follower watches
   # the console pid and stops tail itself.
   ( tail -n 0 -F "$PPI_HOME/bus.jsonl" 2>/dev/null & follower=$!
     while kill -0 "$$" 2>/dev/null; do sleep 1; done
     kill "$follower" 2>/dev/null || true ) </dev/null \
-    | jq -R --unbuffered -j 'fromjson? | select(.to == "operator") | "\n[ppi from=\(.from) to=operator id=\(.id)] \(.msg)\noperator> "' &
+    | jq -R --unbuffered -j "$JQ_LIB"' fromjson?
+        | if .to == "operator" then "\n[ppi from=\(.from) to=operator id=\(.id)] \(.msg)\noperator> "
+          elif .from == "ppi" and .status == "uncertain" then
+            "\n[ppi] batch \(.batch) to \(.to) is uncertain: \(cause). Inspect \(.to), then /requeue \(.batch) to send it again or /dismiss \(.batch) to drop it.\noperator> "
+          else empty end' &
   local line to
   # Default IFS trims surrounding whitespace, so " @claude hi" still parses.
   while read -e -r -p "operator> " line; do
