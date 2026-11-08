@@ -175,6 +175,7 @@ def held:
   | [putbatch, (logline(.id; .to; "uncertain"; "\(.reason)\(if .detail then ": \(.detail)" else "" end)")
                 | .json += {reason: $y.reason, detail: $y.detail})];
 def flat: gsub("[\u0000-\u001f\u007f-\u009f]+"; " ");
+def clean: gsub("[\u0000-\u0009\u000b-\u001f\u007f-\u009f]+"; " ");
 def cause:
   .to as $a | (if .detail then " (\(.detail | flat))" else "" end) as $d
   | {preempted: "\($a) stopped being ready before input\($d); pasted text may sit in its input",
@@ -747,24 +748,37 @@ EOF
   # which keeps readline's cursor column intact.
   # A closed pane kills this process without running traps, so the watch follows
   # the console pid and stops tail itself.
+  # On a terminal, a message, an uncertain batch, or a stopped or unresponsive dispatcher also sets
+  # this pane's program status (OSC 7501) to blocked, which Rex shows on the tab and in the session
+  # picker; the operator's next line clears it. Agent text keeps its newlines and loses every other
+  # control character, so it cannot emit escape sequences; the status text loses them all.
+  local osc=false
+  [ ! -t 1 ] || osc=true
   ( tail -n 0 -F "$PPI_HOME/bus.jsonl" 2>/dev/null & follower=$!
     watch_dispatcher "$$"
     kill "$follower" 2>/dev/null || true ) </dev/null \
-    | jq -R --unbuffered -j "$JQ_LIB"' fromjson?
-        | if .to == "operator" then "\n[ppi from=\(.from) to=operator id=\(.id)] \(.msg)\noperator> "
+    | jq -R --unbuffered -j --argjson osc "$osc" "$JQ_LIB"'
+        def report($kind; $text):
+          if $osc then "\u001b]7501;state=blocked\(if $kind then ":kind=" + $kind else "" end):app=ppi:msg=\($text | flat | .[0:500] | @base64)\u001b\\"
+          else "" end;
+        def notice($text; $alert): (if $alert then report(null; $text) else "" end) + ("\n[ppi] " + $text | clean) + "\noperator> ";
+        fromjson?
+        | if .to == "operator" then
+            report("question"; "\(.from): \(.msg)") + ("\n[ppi from=\(.from) to=operator id=\(.id)] \(.msg)" | clean) + "\noperator> "
           elif .from == "ppi" and .status == "uncertain" then
-            "\n[ppi] batch \(.batch) to \(.to) is uncertain: \(cause). Inspect \(.to), then /requeue \(.batch) to send it again or /dismiss \(.batch) to drop it.\noperator> "
+            notice("batch \(.batch) to \(.to) is uncertain: \(cause). Inspect \(.to), then /requeue \(.batch) to send it again or /dismiss \(.batch) to drop it."; true)
           elif .watch == "stopped" then
-            "\n[ppi] the dispatcher stopped: nothing is delivered until it runs again; /who says why and how to restart it.\noperator> "
+            notice("the dispatcher stopped: nothing is delivered until it runs again; /who says why and how to restart it."; true)
           elif .watch == "unresponsive" then
-            "\n[ppi] the dispatcher has not finished a pass in over 10 s; delivery may be stuck; /who shows more.\noperator> "
-          elif .watch == "running" then "\n[ppi] the dispatcher is running again.\noperator> "
+            notice("the dispatcher has not finished a pass in over 10 s; delivery may be stuck; /who shows more."; true)
+          elif .watch == "running" then notice("the dispatcher is running again."; false)
           elif .watch == "restart" then
-            "\n[ppi] the dispatcher restarted after exit status \(.status) (\(.count) in the last 60 s; it stops at 5 within a minute).\noperator> "
+            notice("the dispatcher restarted after exit status \(.status) (\(.count) in the last 60 s; it stops at 5 within a minute)."; false)
           else empty end' &
   local line to
   # Default IFS trims surrounding whitespace, so " @claude hi" still parses.
   while read -e -r -p "operator> " line; do
+    [ "$osc" = false ] || printf '\033]7501;state=clear\033\\'
     history -s "$line"
     case $line in
       "") ;;
@@ -780,6 +794,7 @@ EOF
       *) echo "usage: @<participant> <message> | /who | /ready <participant> | /requeue <batch> | /dismiss <batch> | /quit" ;;
     esac
   done
+  [ "$osc" = false ] || printf '\033]7501;state=clear\033\\'
 }
 
 # The bus contract. Printed as SessionStart context, compaction included, so the agent never loses it.

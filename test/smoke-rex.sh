@@ -155,6 +155,14 @@ check "console shows a message addressed to the operator" \
   eventually_in "$TMP/console.out" '^\[ppi from=fake2 to=operator id=[0-9]*\] for the console$'
 check "console reprints its prompt after the message" grep -q '^operator> ' "$TMP/console.out"
 check "console does not show agent-bound traffic" fails_with grep -q "not for the console" "$TMP/console.out"
+# An agent's message carrying a forged status report, a second line, BEL, a C1 control, and Unicode.
+FORGED=$(printf 'forged \033]7501;state=error:app=evil\033\\ here\nline two \007\302\233✓ 日本')
+no_controls() { perl -ne 'exit 1 if /[\x00-\x09\x0b-\x1f\x7f]|\xc2[\x80-\x9f]/' "$1"; }
+PPI_ALIAS=fake2 "$PPI" send operator "$FORGED" >/dev/null
+check "the console shows a forged status report in a message as inert text" \
+  eventually_in "$TMP/console.out" ']7501;state=error:app=evil \\ here$'
+check "the message's next line stays a line of its own, with its Unicode" grep -q '^line two  ✓ 日本$' "$TMP/console.out"
+check "a console whose output is not a terminal writes no control bytes, not even its own status" no_controls "$TMP/console.out"
 echo /quit >&7
 exec 7>&-
 wait "$console_pid" || true
@@ -448,9 +456,71 @@ blocks_before=$(block_count)
 check "a second up in the same session is refused" refuses_second_up
 check "a refused up starts nothing" [ "$(block_count)" = "$blocks_before" ]
 
+# What needs the operator sets the console pane's status (OSC 7501); the next line it reads clears it.
+up_root() { "$REX" block call -s "$SMOKE_SESSION" -b "$UP" program_status 2>/dev/null | jq -c '[.records[]? | select((.id // "") == "")][0] // {}'; }
+up_reports() { # kind ("" for none) msg
+  up_root | jq -e --arg kind "$1" --arg msg "$2" '.state == "blocked" and .app == "ppi" and (.kind // "") == $kind and .msg == $msg' >/dev/null
+}
+up_cleared() { [ "$(up_root)" = "{}" ]; }
+emoji() { printf '😀%.0s' $(seq "$1"); }
+env PPI_HOME="$UP_HOME" PPI_ALIAS=upa "$PPI" send operator "$(emoji 1000)" >/dev/null
+check "a message to the operator sets the console blocked, kind question, app ppi, cut to 500 characters Rex accepts" \
+  eventually up_reports question "upa: $(emoji 495)"
+type_into_console /who
+check "the operator's next line clears it" eventually up_cleared
+env PPI_HOME="$UP_HOME" PPI_ALIAS=upa "$PPI" send operator "$FORGED" >/dev/null
+check "the status text of a message is one line, without its control characters" \
+  eventually up_reports question 'upa: forged  ]7501;state=error:app=evil \ here line two  ✓ 日本'
+type_into_console /who
+check "the next line clears that too" eventually up_cleared
+jq -cn '{ts: "00:00:00", batch: 999, from: "ppi", to: "upa", status: "uncertain", msg: "no-observation", reason: "no-observation", detail: null}' \
+  >> "$UP_HOME/bus.jsonl"
+check "an uncertain batch sets the console blocked, without a kind" eventually up_reports "" \
+  "batch 999 to upa is uncertain: Enter went out, but no prompt hook reported the batch in time. Inspect upa, then /requeue 999 to send it again or /dismiss 999 to drop it."
+type_into_console /who
+check "the next line clears the uncertain batch's report" eventually up_cleared
+"$REX" send-key -s "$SMOKE_SESSION" -b "$(jq -r .block "$UP_HOME/dispatcher.lock/owner")" ctrl+c
+check "a stopped dispatcher sets the console blocked, without a kind" eventually up_reports "" \
+  "the dispatcher stopped: nothing is delivered until it runs again; /who says why and how to restart it."
+type_into_console /who
+check "the next line clears the dispatcher's report" eventually up_cleared
+
 type_into_console /quit
 check "/quit ends up cleanly" eventually up_quit_cleanly
 check "the agents keep running after /quit" upa_running
+
+# The console's own bytes on a terminal, recorded by script in a pane of its own: a forged report
+# that got through would show here even where a legitimate report follows and replaces it in Rex.
+PTYH=$TMP/ptyhome
+PTY=$(pane pty --keep-open -- script -q -t 0 "$TMP/pty.out" env PPI_HOME="$PTYH" "$PPI" console)
+check "a console on a terminal reports the absent dispatcher (precondition)" eventually grep -qs 'the dispatcher stopped' "$TMP/pty.out"
+env PPI_HOME="$PTYH" PPI_ALIAS=pa "$PPI" send operator "$FORGED" >/dev/null
+check "it shows the forged message (precondition)" eventually grep -qs 'line two' "$TMP/pty.out"
+type_into "$PTY" /who
+check "it answers /who (precondition)" eventually grep -qs 'agent-to-agent sends' "$TMP/pty.out"
+env PPI_HOME="$PTYH" PPI_ALIAS=pa "$PPI" send operator "$(emoji 1000)" >/dev/null
+check "it shows the long message (precondition)" eventually grep -qs "$(emoji 1000)" "$TMP/pty.out"
+type_into "$PTY" /quit
+check "it quits (precondition)" eventually exited_but_open "$PTY"
+osc_reports() {
+  perl -MMIME::Base64 -0777 -ne 'while (/\e\]7501;([^\e]*)\e\\/g) { my $p = $1; $p =~ s/msg=([A-Za-z0-9+\/=]*)/"msg=" . decode_base64($1)/e; print "$p\n" }' "$1"
+}
+expected_reports=$(printf '%s\n' \
+  'state=blocked:app=ppi:msg=the dispatcher stopped: nothing is delivered until it runs again; /who says why and how to restart it.' \
+  'state=blocked:kind=question:app=ppi:msg=pa: forged  ]7501;state=error:app=evil \ here line two  ✓ 日本' \
+  'state=clear' \
+  "state=blocked:kind=question:app=ppi:msg=pa: $(emoji 496)" \
+  'state=clear' \
+  'state=clear')
+check "on a terminal the console writes exactly its own reports and clears, none forged" [ "$(osc_reports "$TMP/pty.out")" = "$expected_reports" ]
+osc_within_limits() {
+  perl -MMIME::Base64 -0777 -ne 'while (/(\e\]7501;([^\e]*)\e\\)/g) { my ($all, $p) = ($1, $2); exit 1 if length($all) > 4096;
+    if ($p =~ /msg=([A-Za-z0-9+\/=]*)/) { exit 1 if length($1) > 2732; my $d = decode_base64($1);
+      exit 1 if length($d) > 2048 || $d =~ /[\x00-\x1f\x7f]|\xc2[\x80-\x9f]/ } }' "$1"
+}
+check "each report is within Rex's limits, its text free of control characters" osc_within_limits "$TMP/pty.out"
+pty_display() { perl -0777 -ne 'exit 1 unless /\[ppi from=pa to=operator id=\d+\] forged  \]7501;state=error:app=evil \\ here\r\nline two  ✓ 日本\r\noperator> /' "$1"; }
+check "on a terminal too, the message shows with its newline and Unicode and nothing in between" pty_display "$TMP/pty.out"
 
 # The state model on a bus of its own, against a stub rex that answers block calls from fixture
 # files: batches, hook observations, holds, and operator resolution, with no Rex session involved.
@@ -1154,6 +1224,15 @@ check "input queued for it is held as no-identity" grep -q "^sx .*hold=no-identi
 check "the held input stays queued" queued_count sx 1
 
 check "who reports the dispatcher running, with its last pass" grep -qE "^dispatcher: running in $DISP1; last pass [0-2]s ago$" <<<"$(dppi who)"
+# The bus tab shows an agent's message with its newlines and without its control characters.
+env PPI_HOME="$DH" PPI_ALIAS=si "$PPI" send operator "$FORGED" >/dev/null
+check "the bus tab shows a forged status report as inert text" eventually captured "$DISP1" ']7501;state=error:app=evil \ here'
+bus_line_two() { "$REX" capture -s "$SMOKE_SESSION" -b "$DISP1" --trim 2>/dev/null | grep -q '^line two   ✓ 日本$'; }
+check "and the message's next line as a line of its own, with its Unicode" bus_line_two
+no_forged_status() {
+  "$REX" block call -s "$SMOKE_SESSION" -b "$DISP1" program_status | jq -e '[.records[]? | select(.app == "evil" or .state == "error")] | length == 0' >/dev/null
+}
+check "the forged report sets no status on the bus tab" no_forged_status
 # An operator console on this bus follows the dispatcher's health from here to its stop.
 mkfifo "$TMP/hconsole.in"
 env PPI_HOME="$DH" "$PPI" console <"$TMP/hconsole.in" >"$TMP/hconsole.out" 2>&1 &

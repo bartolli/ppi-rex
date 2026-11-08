@@ -152,8 +152,14 @@ local colors = {
   queued = "33", reserved = "33", submitted = "33", observed = "33",
   failed = "31", blocked = "31", uncertain = "31", ["hook-failure"] = "31",
 }
+-- Bus text keeps its newlines and loses every other control character (C0, DEL, and C1, which UTF-8
+-- encodes after \194), so an agent's message cannot emit escape sequences into this pane.
 local function text_of(v)
-  if type(v) == "string" then return v end
+  if type(v) == "string" then
+    v = v:gsub("\194[\128-\159]", " ")
+    v = v:gsub("[%z\1-\9\11-\31\127]", " ")
+    return v
+  end
   if type(v) == "number" then return tostring(v) end
   return ""
 end
