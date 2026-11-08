@@ -178,8 +178,8 @@ check "compaction records no new session" last_record "$PPI_HOME/session/fake1" 
 check "session start names the participant" grep -q 'bus is "fake1"' <<<"$ctx"
 check "session start names the envelope as the trigger" grep -q '\[ppi from=<sender> to=fake1 id=<id> batch=<batch>\]' <<<"$ctx"
 check "session start prints how to send, through PPI_BIN" grep -qF '"$PPI_BIN" send <participant>' <<<"$ctx"
-check "session start routes participants only through PPI_BIN, never a same-named tool" \
-  grep -qF 'contact them only with "$PPI_BIN" send, never a same-named tool or subagent' <<<"$ctx"
+check "session start routes participants only through PPI_BIN, never a same-named tool or rex" \
+  grep -qF 'contact them only with "$PPI_BIN" send, never a same-named tool or subagent, and never rex commands aimed at their panes.' <<<"$ctx"
 check "session start names no bare ppi command" fails_with grep -qE '(^|[ :])ppi (send|who)' <<<"$ctx"
 check "session start prints the send results and loop rules" grep -q "do not resend" <<<"$ctx"
 check "session start says a send to an agent is queued" grep -q "queued for <name> .*at its prompt" <<<"$ctx"

@@ -824,7 +824,7 @@ WHAT TO DO, IN ORDER
 4. Then finish your response and stop. Do not wait, sleep, or poll "$PPI_BIN" who: an answer arrives as a new bus message, and a message queued for you is delivered only after you stop.
 
 HOW TO SEND
-Participant names identify registered bus arms; contact them only with "$PPI_BIN" send, never a same-named tool or subagent.
+Participant names identify registered bus arms; contact them only with "$PPI_BIN" send, never a same-named tool or subagent, and never rex commands aimed at their panes.
 One message per command, text on stdin through a quoted heredoc:
   "$PPI_BIN" send <participant> <<'EOF'
   <text>
