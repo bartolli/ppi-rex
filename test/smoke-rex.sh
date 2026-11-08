@@ -985,7 +985,8 @@ cat > "$STANDIN" <<'EOF'
 # A marker in the prompt picks a variant: standin:blocked (no Stop, then done), standin:cancel
 # (no Stop, then idle), standin:exit (clear, exit 0), standin:missed (the prompt hook runs while
 # its lock is held past the deadline, then done), standin:busy-on-paste, which reports working
-# as soon as the paste closes, before any Enter.
+# as soon as the paste closes, before any Enter, standin:late (working, then its prompt and Stop
+# hooks wait for its go file). Each closed paste is recorded before any Enter.
 # Ctrl-D at its prompt quits and leaves the last status, as a harness quitting at its prompt does.
 export LC_ALL=C
 me=$PPI_ALIAS out=$PPI_HOME/standin.$PPI_ALIAS n=0
@@ -1007,6 +1008,7 @@ turn() {
       status done
       return
       ;;
+    *standin:late*) until [ -e "$out.go" ]; do sleep 0.05; done ;;
   esac
   hook prompt "$1"
   case $1 in
@@ -1035,6 +1037,7 @@ while IFS= read -r -n 1 -d "" -u 3 c; do
     line+=$c
     if [[ $line == *"$close" ]]; then
       line=${line%"$close"} pasting=0
+      printf '%s' "$line" > "$out.pasted.$((n + 1))"
       case $line in *standin:busy-on-paste*) status working ;; esac
     fi
   elif [ "$c" = $'\004' ]; then
@@ -1491,8 +1494,8 @@ check "and who records the stop as a signal" grep -qE "^dispatcher: not running;
 # sixth failure. Old restarts leaving the 60 s window are not exercised here.
 DISP8=$(dispatcher_pane bus8)
 check "a fresh dispatcher runs with its reader (precondition)" eventually owned_with_reader "$DISP8"
-SUP8=$(owner_pid)
-script_of() { pgrep -P "$SUP8" -x rex | head -n 1; }
+SUP=$(owner_pid)
+script_of() { pgrep -P "$SUP" -x rex | head -n 1; }
 running_anew() { local s; s=$(script_of) && [ -n "$s" ] && [ "$s" != "$KILLED" ] && [ "$(reader_pid)" != "$KILLED_READER" ] && reader_alive; }
 restarted_as() { running_anew && [ "$(jq '.times | length' "$DH/dispatcher.lock/restarts" 2>/dev/null)" = "$1" ]; }
 for k in 1 2 3 4 5; do
@@ -1510,5 +1513,112 @@ check "it removes its lock" [ ! -e "$DH/dispatcher.lock" ]
 check "and stops its last reader" eventually gone_pid "$R8"
 check "who reports the restart cap" grep -qE \
   "^dispatcher: not running; it stopped at [0-9:]{8} after 5 restarts within 60 s, the last after exit status 137$" <<<"$(dppi who)"
+
+# A script killed at each delivery boundary: before the paste (the first check), after the paste and
+# before Enter (the second check), and after Enter before its transport result is recorded. A jq on
+# the dispatcher's PATH, armed with the script's pid, kills it at that step and fails the step
+# silently, so the step writes nothing. Each restart holds the attempt, and none is sent again.
+mkdir "$TMP/killjq"
+cat > "$TMP/killjq/jq" <<EOF
+#!/bin/sh
+prev="" op="" last=""
+for a in "\$@"; do
+  if [ "\$prev" = op ]; then op=\$a; fi
+  prev=\$a last=\$a
+done
+if [ -e "$TMP/killjq.arm" ]; then
+  read -r point pid < "$TMP/killjq.arm"
+  fire=""
+  case \$point:\$last in
+    check1:*'check(\$b)') fire=1 ;;
+    check*:*'check(\$b)') echo "check\$((\${point#check} - 1)) \$pid" > "$TMP/killjq.arm" ;;
+    submitted:*'op(\$b; \$op; \$reason; \$detail)') [ "\$op" != submitted ] || fire=1 ;;
+  esac
+  if [ -n "\$fire" ]; then rm -f "$TMP/killjq.arm"; kill -9 "\$pid"; exit 9; fi
+fi
+exec $(command -v jq) "\$@"
+EOF
+chmod +x "$TMP/killjq/jq"
+check "the capped dispatcher left no lock behind (precondition)" locks_cleared
+SK=$(pane sk --keep-open -- env PPI_HOME="$DH" "$PPI" run --runtime fake sk "$STANDIN")
+check "a fresh stand-in is at its prompt (precondition)" eventually test -e "$DH/standin.sk.ready"
+type_into "$SK" hello
+check "it validates on a typed prompt (precondition)" eventually test -s "$DH/stops/sk"
+DISP9=$(pane bus9 --keep-open -- env PATH="$TMP/killjq:$PATH" PPI_HOME="$DH" "$PPI" dispatch)
+check "the dispatcher with the killing jq runs (precondition)" eventually owned_with_reader "$DISP9"
+SUP=$(owner_pid)
+restart_max() { jq '.times | max' "$DH/dispatcher.lock/restarts" 2>/dev/null || echo 0; }
+arm_kill() { # point
+  KILLED=$(script_of) KILLED_READER=$(reader_pid || true) LAST_RESTART=$(restart_max)
+  echo "$1 $KILLED" > "$TMP/killjq.arm"
+}
+# The armed script is gone and a new restart is recorded with the status a SIGKILL gives.
+killed_and_restarted() {
+  gone_pid "$KILLED" && running_anew &&
+    jq -e --argjson t "$LAST_RESTART" '.status == 137 and (.times | max) > $t' "$DH/dispatcher.lock/restarts" >/dev/null 2>&1
+}
+held_as() { eventually dbatch_is "$1" '"\(.evidence)/\(.disposition) \(.reason)"' "$2"; }
+agent_done() {
+  "$REX" block call -s "$SMOKE_SESSION" -b "$SK" program_status | jq -e '[.records[] | select((.id // "") == "")][0].state == "done"' >/dev/null
+}
+# The dispatcher touches its heartbeat at the end of each pass.
+passes_after() { local t; t=$(date +%s); eventually bash -c '[ "$(stat -f %m "$1")" -ge "$2" ]' _ "$DH/heartbeat" $((t + 3)); }
+not_replayed() { # batch next-prompt-number
+  [ "$(batch_for sk)" = "$1" ] && queued_count sk 0 && [ ! -e "$DH/standin.sk.pasted.$2" ] && [ ! -e "$DH/standin.sk.raw.$2" ]
+}
+prompt_is() { # batch prompt-number
+  quiet_jq -se --arg t "$(jq -r .text "$DH/batches/$1")" --argjson n "$2" 'length == $n and .[$n - 1] == $t' "$DH/standin.sk.prompts"
+}
+stop_for() {
+  local p
+  p=$(jq -r '.pid // ""' "$DH/batches/$1") && [ -n "$p" ] &&
+    quiet_jq -se --arg p "$p" 'any(.[]; .pid == $p and .event == "stop")' "$DH/stops/sk" 2>/dev/null
+}
+
+arm_kill check1
+dsend sk "killed before the paste"
+check "a script killed at the first check is restarted after status 137" eventually killed_and_restarted
+check "the killed check left no lock behind" locks_cleared
+B0=$(batch_for sk)
+check "the restart holds the attempt killed before its paste" held_as "$B0" "attempting/uncertain restart"
+check "the dispatcher passes after the restart (precondition)" passes_after
+check "no paste reached the agent, and nothing was sent again" not_replayed "$B0" 2
+dppi batch dismiss "$B0" >/dev/null
+
+arm_kill check2
+dsend sk "killed before Enter"
+check "a script killed at the second check is restarted after status 137" eventually killed_and_restarted
+check "the killed check left no lock behind" locks_cleared
+BA=$(batch_for sk)
+check "the restart holds the attempt killed between paste and Enter" held_as "$BA" "attempting/uncertain restart"
+check "the paste reached the agent, and no Enter followed it" \
+  bash -c '[ "$(cat "$1.pasted.2")" = "$(jq -r .text "$2")" ] && [ ! -e "$1.raw.2" ]' _ "$DH/standin.sk" "$DH/batches/$BA"
+"$REX" send-key -s "$SMOKE_SESSION" -b "$SK" enter
+check "Enter typed later makes the paste a prompt, exactly the batch text" eventually prompt_is "$BA" 2
+check "its matching Stop is recorded (precondition)" eventually stop_for "$BA"
+check "the late evidence is kept, and the Stop leaves the hold" held_as "$BA" "observed/uncertain restart"
+check "the agent is done (precondition)" eventually agent_done
+check "the dispatcher passes after the agent is done (precondition)" passes_after
+check "the attempt killed before Enter is not sent again" not_replayed "$BA" 3
+check "and it is still held" held_as "$BA" "observed/uncertain restart"
+dppi batch dismiss "$BA" >/dev/null
+
+# The agent's hooks wait for its go file, so no observation lands before the restart reconciles.
+arm_kill submitted
+dsend sk "standin:late killed before the transport result"
+check "a script killed at the transport record is restarted after status 137" eventually killed_and_restarted
+check "the killed record left no lock behind" locks_cleared
+BT=$(batch_for sk)
+check "the restart holds the attempt killed after Enter, its transport result unrecorded" held_as "$BT" "attempting/uncertain restart"
+sk_entered() { printf '\033[200~%s\033[201~\r' "$(jq -r .text "$DH/batches/$1")" | cmp -s - "$DH/standin.sk.raw.$2"; }
+check "the paste and Enter reached the agent before the kill" sk_entered "$BT" 3
+touch "$DH/standin.sk.go"
+check "its prompt is exactly the batch text" eventually prompt_is "$BT" 3
+check "its matching Stop is recorded (precondition)" eventually stop_for "$BT"
+check "the late evidence is kept, and the Stop leaves the hold" held_as "$BT" "observed/uncertain restart"
+check "the agent is done (precondition)" eventually agent_done
+check "the dispatcher passes after the agent is done (precondition)" passes_after
+check "the attempt killed after Enter is not sent again" not_replayed "$BT" 4
+check "and it is still held" held_as "$BT" "observed/uncertain restart"
 
 if [ "$fails" -eq 0 ]; then echo "all passed"; else echo "$fails failed"; exit 1; fi
