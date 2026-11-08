@@ -1238,11 +1238,22 @@ mkfifo "$TMP/hconsole.in"
 env PPI_HOME="$DH" "$PPI" console <"$TMP/hconsole.in" >"$TMP/hconsole.out" 2>&1 &
 hconsole_pid=$!
 exec 8>"$TMP/hconsole.in"
+# The same health on a terminal, read back from Rex: a restart or a recovery leaves a pending report
+# in place; an unresponsive dispatcher's alert replaces it.
+HPTY=$(pane hpty --keep-open -- env PPI_HOME="$DH" "$PPI" console)
+hpty_reports() { # kind ("" for none) msg
+  "$REX" block call -s "$SMOKE_SESSION" -b "$HPTY" program_status 2>/dev/null |
+    jq -e --arg kind "$1" --arg msg "$2" '[.records[]? | select((.id // "") == "")][0] // {}
+      | .state == "blocked" and .app == "ppi" and (.kind // "") == $kind and .msg == $msg' >/dev/null
+}
+UNRESPONSIVE="the dispatcher has not finished a pass in over 10 s; delivery may be stuck; /who shows more."
 lines=$(wc -l < "$DH/bus.jsonl")
 sleep 3
 check "an idle bus with a running dispatcher logs nothing" [ "$(wc -l < "$DH/bus.jsonl")" -eq "$lines" ]
 sleep 1.5
 check "the console says nothing about a running dispatcher" fails_with grep -q '\[ppi\] the dispatcher' "$TMP/hconsole.out"
+env PPI_HOME="$DH" PPI_ALIAS=si "$PPI" send operator "pending question" >/dev/null
+check "a terminal console holds a question report (precondition)" eventually hpty_reports question "si: pending question"
 
 # A restart recorded 30 s ago stands in for one about to age out of the window: the next restart
 # replaces it, so the count over the last minute stays at one while a new restart is recorded.
@@ -1255,6 +1266,8 @@ check "a killed dispatcher script is restarted under the same owner" eventually 
 check "the killed script's orphaned reader is stopped" eventually gone_pid "$R1"
 check "the console reports the restart, though the count stayed at one" eventually_in "$TMP/hconsole.out" \
   '^\[ppi\] the dispatcher restarted after exit status 137 (1 in the last 60 s; it stops at 5 within a minute)\.$'
+check "the terminal console shows the restart (precondition)" eventually captured "$HPTY" 'the dispatcher restarted after exit status 137'
+check "a restart notice leaves the pending question report in place" hpty_reports question "si: pending question"
 check "who counts the restart and gives its exit status" grep -qE \
   "^dispatcher: running in $DISP1; last pass [0-9]+s ago; 1 restart in the last 60 s, the last after exit status 137$" <<<"$(dppi who)"
 
@@ -1267,8 +1280,12 @@ check "who reports a live owner with no recent pass as unresponsive" grep -qE \
   <<<"$(dppi who)"
 check "the console reports it" eventually_in "$TMP/hconsole.out" \
   '^\[ppi\] the dispatcher has not finished a pass in over 10 s; delivery may be stuck; /who shows more\.$'
+check "the unresponsive alert replaces the question report, blocked without a kind" eventually hpty_reports "" "$UNRESPONSIVE"
 kill -CONT "$SCRIPT1"
 check "the console reports the recovery" eventually_in "$TMP/hconsole.out" '^\[ppi\] the dispatcher is running again\.$'
+check "the terminal console shows the recovery (precondition)" eventually captured "$HPTY" 'the dispatcher is running again.'
+check "a recovery notice leaves the unresponsive alert in place" hpty_reports "" "$UNRESPONSIVE"
+type_into "$HPTY" /quit
 
 R2=$(reader_pid)
 "$REX" send-key -s "$SMOKE_SESSION" -b "$DISP1" ctrl+c
