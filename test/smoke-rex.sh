@@ -707,15 +707,6 @@ check "/ready refuses when a prompt arrives between its read and its write" fail
 check "a refused /ready writes no baseline" [ ! -e "$SYN/ready/sa" ]
 check "the arm still holds after the refusal" hold_is "$(stick sa)" no-stop
 
-# A busy alias lock holds that alias for the pass: neither tick nor the start reconciliation waits for it.
-mkdir "$SYN/locks/sa.lock"
-out=$(stick sa) || out="exit $?"
-check "tick holds an alias whose lock is busy, reason locked" hold_is "$out" locked
-check "and leaves no .turns lock behind" [ ! -e "$SYN/locks/.turns.lock" ]
-out=$(syn "$PPI" batch restart sa) || out="exit $?"
-check "the start reconciliation reports a busy alias lock as locked" quiet_jq -e '.result == "locked"' <<<"$out"
-rmdir "$SYN/locks/sa.lock"
-
 # A missed observation after startup validation, then a blocked prompt's done re-report.
 shook sa stop "$(stop_in S1 P4)"
 mkdir "$SYN/locks/sa.lock"
@@ -740,6 +731,25 @@ syn "$PPI" ready sa >/dev/null
 check "/ready acknowledges exactly the generations it inspected" bash -c '[ ! -e "$1/1.json" ] && [ ! -e "$1/2.json" ]' _ "$SYN/holds/sa"
 check "a failure from another harness session neither holds nor is acknowledged" [ -e "$SYN/holds/sa/3.json" ]
 check "the baseline names the acknowledged generations" last_record "$SYN/ready/sa" '.hold_generations == [1, 2]'
+# A busy lock holds an arm that is otherwise ready: tick tries .turns and the alias lock once each,
+# the start reconciliation tries the alias lock once, and neither changes a record or a held lock.
+# Once both are free, the reservation below goes ahead.
+syn_state() { (cd "$SYN" && find . -path ./locks -prune -o -type f -print | LC_ALL=C sort | xargs cat) | shasum; }
+before=$(syn_state)
+mkdir "$SYN/locks/.turns.lock"
+out=$(stick sa) || out="exit $?"
+check "tick holds a ready arm while .turns is busy, reason locked" hold_is "$out" locked
+check "and leaves the held .turns lock in place" [ -d "$SYN/locks/.turns.lock" ]
+rmdir "$SYN/locks/.turns.lock"
+mkdir "$SYN/locks/sa.lock"
+out=$(stick sa) || out="exit $?"
+check "tick holds it while its alias lock is busy, reason locked" hold_is "$out" locked
+check "and releases the .turns lock it took" [ ! -e "$SYN/locks/.turns.lock" ]
+out=$(syn "$PPI" batch restart sa) || out="exit $?"
+check "the start reconciliation reports a busy alias lock as locked" quiet_jq -e '.result == "locked"' <<<"$out"
+check "and leaves the held alias lock in place" [ -d "$SYN/locks/sa.lock" ]
+rmdir "$SYN/locks/sa.lock"
+check "a busy lock changes no record" [ "$(syn_state)" = "$before" ]
 out=$(stick sa)
 B5=$(jq -r .batch <<<"$out")
 check "delivery resumes once the failures are acknowledged" action_is "$out" paste
