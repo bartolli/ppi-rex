@@ -1467,4 +1467,28 @@ check "the supervisor waits out its restart backoff (precondition)" eventually i
 check "Ctrl-C during the backoff ends the dispatcher" eventually exited_but_open "$DISP7"
 check "and who records the stop as a signal" grep -qE "^dispatcher: not running; it stopped at [0-9:]{8} on a signal$" <<<"$(dppi who)"
 
+# The restart cap: a fresh supervisor restarts five failed scripts within a minute and stops on the
+# sixth failure. Old restarts leaving the 60 s window are not exercised here.
+DISP8=$(dispatcher_pane bus8)
+check "a fresh dispatcher runs with its reader (precondition)" eventually owned_with_reader "$DISP8"
+SUP8=$(owner_pid)
+script_of() { pgrep -P "$SUP8" -x rex | head -n 1; }
+running_anew() { local s; s=$(script_of) && [ -n "$s" ] && [ "$s" != "$KILLED" ] && [ "$(reader_pid)" != "$KILLED_READER" ] && reader_alive; }
+restarted_as() { running_anew && [ "$(jq '.times | length' "$DH/dispatcher.lock/restarts" 2>/dev/null)" = "$1" ]; }
+for k in 1 2 3 4 5; do
+  # A supervisor that already stopped leaves no lock, reader record, or script to read or kill.
+  KILLED=$(script_of) KILLED_READER=$(reader_pid || true)
+  kill -9 "$KILLED" 2>/dev/null || true
+  check "killed script $k is restarted, with $k restarts in the window" eventually restarted_as "$k"
+done
+R8=$(reader_pid || true)
+kill -9 "$(script_of)" 2>/dev/null || true
+check "the sixth failure within the minute stops the supervisor with status 1" eventually exited_with "$DISP8" 1
+check "its last stop is the restart cap, after the killed script's status" \
+  last_record "$DH/dispatcher.last" '.why == "restart-cap" and .status == 137'
+check "it removes its lock" [ ! -e "$DH/dispatcher.lock" ]
+check "and stops its last reader" eventually gone_pid "$R8"
+check "who reports the restart cap" grep -qE \
+  "^dispatcher: not running; it stopped at [0-9:]{8} after 5 restarts within 60 s, the last after exit status 137$" <<<"$(dppi who)"
+
 if [ "$fails" -eq 0 ]; then echo "all passed"; else echo "$fails failed"; exit 1; fi
