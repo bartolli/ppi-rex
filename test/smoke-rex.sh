@@ -1096,18 +1096,18 @@ who_out=$(dppi who)
 check "who reports no dispatcher" grep -qx "dispatcher: not running" <<<"$who_out"
 check "and gives the operator the command that starts one for this session and bus" grep -qF -- \
   "window new -s $REX_SESSION ppi\\ bus --shell=none --keep-open --focus=false -- env PPI_HOME=$DH $PPI dispatch" <<<"$who_out"
-check "an agent's who leaves the restart command out" fails_with grep -q "restart:" <<<"$(env PPI_HOME="$DH" PPI_ALIAS=zz "$PPI" who)"
+check "an agent's who leaves the restart command out" fails_with grep -q "restart from a shell:" <<<"$(env PPI_HOME="$DH" PPI_ALIAS=zz "$PPI" who)"
 mkdir "$DH/dispatcher.lock"
 who_out=$(dppi who)
 check "who reports a lock with no complete owner record as unknown" grep -qxF \
   "dispatcher: unknown; the lock has no complete owner record ($DH/dispatcher.lock); remove it if no dispatcher runs" <<<"$who_out"
-check "and offers no restart command for it" fails_with grep -q "restart:" <<<"$who_out"
+check "and offers no restart command for it" fails_with grep -q "restart from a shell:" <<<"$who_out"
 for bad in '{' '"x"'; do
   printf '%s\n' "$bad" > "$DH/dispatcher.lock/owner"
   who_out=$(dppi who 2>&1) || true
   check "who reports an owner record of $bad as incomplete, not as an error" grep -qxF \
     "dispatcher: unknown; the lock has no complete owner record ($DH/dispatcher.lock); remove it if no dispatcher runs" <<<"$who_out"
-  check "and offers no restart command for it ($bad)" fails_with grep -q "restart:" <<<"$who_out"
+  check "and offers no restart command for it ($bad)" fails_with grep -q "restart from a shell:" <<<"$who_out"
 done
 rm -rf "$DH/dispatcher.lock"
 
@@ -1150,7 +1150,7 @@ jq -cn --arg b "$CLOSED" --arg s "$REX_SESSION" '{pid: 1, block: $b, session: $s
 who_out=$(dppi who)
 check "who reports a lock whose owner's block is gone as stopped and replaceable" grep -qx \
   "dispatcher: stopped; its block $CLOSED is gone; the next ppi dispatch replaces this lock" <<<"$who_out"
-check "with the restart command" grep -q '^  restart: ' <<<"$who_out"
+check "with the restart command" grep -q '^  restart from a shell: ' <<<"$who_out"
 rm -rf "$DH/dispatcher.lock"
 
 DISP1=$(dispatcher_pane bus1)
@@ -1333,6 +1333,8 @@ type_into "$HPTY" /quit
 R2=$(reader_pid)
 "$REX" send-key -s "$SMOKE_SESSION" -b "$DISP1" ctrl+c
 check "Ctrl-C in the dispatcher pane ends it" eventually exited_but_open "$DISP1"
+check "the stopped pane says it takes no input and where the restart command is" captured "$DISP1" \
+  "ppi: the dispatcher stopped. This pane takes no input; close it. In the console, /who says why and gives the restart command."
 check "Ctrl-C leaves no dispatcher lock" [ ! -e "$DH/dispatcher.lock" ]
 check "Ctrl-C leaves no reader" eventually gone_pid "$R2"
 check "the console reports the dispatcher stopped" eventually_in "$TMP/hconsole.out" \
@@ -1348,7 +1350,7 @@ check "a console started while the dispatcher is down reports it" grep -q \
   '^\[ppi\] the dispatcher stopped: nothing is delivered until it runs again; /who says why and how to restart it\.$' "$TMP/lconsole.out"
 
 # The successor starts with the restart command who printed.
-bash -c "$(sed -n 's/^  restart: //p' <<<"$who_out")" >/dev/null
+bash -c "$(sed -n 's/^  restart from a shell: //p' <<<"$who_out")" >/dev/null
 new_owner() { local b; b=$(jq -r '.block // ""' "$DH/dispatcher.lock/owner" 2>/dev/null) && [ -n "$b" ] && owner_is "$b"; }
 check "the restart command who printed starts a dispatcher that owns the lock" eventually new_owner
 DISP3=$(jq -r '.block // ""' "$DH/dispatcher.lock/owner" 2>/dev/null || true)
@@ -1361,7 +1363,7 @@ check "a supervisor killed outright leaves its lock (precondition)" [ "$(owner_p
 who_out=$(dppi who)
 check "who reports a lock whose owner's program exited as stopped and replaceable" grep -qx \
   "dispatcher: stopped; its program in $DISP3 exited; the next ppi dispatch replaces this lock" <<<"$who_out"
-check "with the restart command" grep -q '^  restart: ' <<<"$who_out"
+check "with the restart command" grep -q '^  restart from a shell: ' <<<"$who_out"
 check "the killed supervisor's script does not outlive it" eventually gone_pid "$SCRIPT3"
 # A stale alias lock at the start holds that alias, not the bus: the script keeps running and
 # reconciles the alias once the lock is gone.

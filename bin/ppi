@@ -1039,7 +1039,7 @@ who_dispatcher() { # operator
         elif $age != null and $age <= $stale then "running in \($block); \($pass)\($rs)"
         else "unresponsive in \($block); \($pass); health unknown, not stopped\($rs)" end)'
   case $1:$OWNER_STATE in
-    true:absent | true:exited | true:gone) printf '  restart: %s\n' "$(restart_command)" ;;
+    true:absent | true:exited | true:gone) printf '  restart from a shell: %s\n' "$(restart_command)" ;;
   esac
 }
 
@@ -1133,6 +1133,8 @@ release_dispatcher() {
       '{why: $why, status: ($status | tonumber? // null), hr: now}' | put "$PPI_HOME/dispatcher.last" || true
     stop_reader "$PPI_HOME/dispatcher.lock"
     rm -rf "$PPI_HOME/dispatcher.lock"
+    # The pane stays open with this output and no shell.
+    echo "ppi: the dispatcher stopped. This pane takes no input; close it. In the console, /who says why and gives the restart command." >&2
   fi
   unlock
 }
