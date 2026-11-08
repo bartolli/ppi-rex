@@ -285,10 +285,15 @@ check "a blocked send queues nothing" cmp -s "$TMP/queue-before" "$PPI_HOME/queu
 check "a blocked send leaves the count at 20" turns_are 20
 PPI_ALIAS=fake1 "$PPI" send operator "limit reached" >/dev/null
 check "agent-to-operator sends remain available without resetting the count" turns_are 20
+turns_inode() { stat -f %i "$PPI_HOME/turns"; }
+i0=$(turns_inode)
 PPI_ALIAS=operator "$PPI" send fake1 "reset the limit" >/dev/null
 check "an operator message resets the count" turns_are 0
+i1=$(turns_inode)
 PPI_ALIAS=fake2 "$PPI" send fake1 "after reset" >/dev/null
 check "agent sends resume after the reset" turns_are 1
+renamed() { [ "$i0" != "$i1" ] && [ "$i1" != "$(turns_inode)" ]; }
+check "the count is written by rename, at the reset and at an agent send" renamed
 check "an undeliverable agent send fails" fails_with env PPI_ALIAS=fake2 "$PPI" send gone "agent into the void"
 check "an undeliverable send consumes no budget" turns_are 1
 PPI_ALIAS=operator "$PPI" send operator "reset concurrency test" >/dev/null
@@ -328,6 +333,21 @@ parallel_queued() {
     "$PPI_HOME/queue/fake1" "$PPI_HOME/queue/fake2" >/dev/null
 }
 check "only accepted concurrent sends enter queues" parallel_queued
+
+# who reads the count without .turns, and reports a lock held 10 s or more by its age alone.
+mkdir "$PPI_HOME/locks/.turns.lock" "$PPI_HOME/locks/fake1.lock" "$PPI_HOME/locks/fake2.lock"
+perl -e 'utime time - 42, time - 42, @ARGV' "$PPI_HOME/locks/.turns.lock" "$PPI_HOME/locks/fake1.lock"
+who_out=$("$PPI" who) || who_out="exit $?"
+check "who reads the count while .turns is held" grep -qx 'agent-to-agent sends: 20/20' <<<"$who_out"
+check "who reports a lock held 10 s or more by its age, owner unknown" grep -qE '^lock fake1: held 4[0-9]s; owner unknown$' <<<"$who_out"
+check "including .turns" grep -qE '^lock \.turns: held 4[0-9]s; owner unknown$' <<<"$who_out"
+check "with the recovery for the operator" grep -qxF \
+  "  recovery: stop the dispatcher, keep the operator and every agent from sending or prompting, and wait for every running ppi command and hook to finish; if this lock is still held then, rmdir $(printf %q "$PPI_HOME/locks/fake1.lock")" <<<"$who_out"
+check "but not a lock held briefly" fails_with grep -q '^lock fake2:' <<<"$who_out"
+agent_who=$(PPI_ALIAS=fake1 "$PPI" who) || agent_who="exit $?"
+check "an agent's who reports the lock" grep -q '^lock fake1: held' <<<"$agent_who"
+check "without the recovery" fails_with grep -q 'recovery:' <<<"$agent_who"
+rmdir "$PPI_HOME/locks/.turns.lock" "$PPI_HOME/locks/fake1.lock" "$PPI_HOME/locks/fake2.lock"
 check "concurrent sends get distinct ids" \
   quiet_jq -se '[.[] | select(.msg | startswith("parallel ")) | .id] | length == 20 and (unique | length) == 20' \
   "$PPI_HOME/queue/fake1" "$PPI_HOME/queue/fake2"

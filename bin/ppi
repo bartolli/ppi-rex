@@ -80,7 +80,7 @@ lock_try() { # name seconds
   done
   LOCKED[${#LOCKED[@]}]=$dir
 }
-lock() { lock_try "$1" 5 || die "lock held: $PPI_HOME/locks/$1.lock (remove it if stale)"; }
+lock() { lock_try "$1" 5 || die "lock held: $PPI_HOME/locks/$1.lock (the operator's ppi who reports a lock held ${LOCK_REPORT_AGE}s)"; }
 unlock() {
   local i
   for ((i=${#LOCKED[@]}-1; i>=0; i--)); do
@@ -665,7 +665,8 @@ cmd_send() {
   fi
   # Serialize counting, ids, and queueing across recipients; hooks only take participant locks.
   lock .turns
-  if [ "$from" = operator ]; then echo 0 > "$PPI_HOME/turns"; fi
+  # turns is written by rename, so who reads it without .turns.
+  if [ "$from" = operator ]; then echo 0 | put "$PPI_HOME/turns"; fi
   if [ "$to" = operator ]; then
     id=$(next_id)
     log "$from" operator delivered "$msg" "$id"
@@ -680,7 +681,7 @@ cmd_send() {
   fi
   id=$(next_id)
   lock "$to"
-  if [ "$from" != operator ]; then echo $((count + 1)) > "$PPI_HOME/turns"; fi
+  if [ "$from" != operator ]; then echo $((count + 1)) | put "$PPI_HOME/turns"; fi
   append "$PPI_HOME/queue/$to" "$(jq -cn --argjson id "$id" --arg from "$from" --arg msg "$msg" '{id: $id, from: $from, msg: $msg}')"
   log "$from" "$to" queued "$msg" "$id"
   unlock
@@ -691,9 +692,7 @@ cmd_who() {
   init_home
   local f alias count operator=false
   [ "${PPI_ALIAS:-operator}" != operator ] || operator=true
-  lock .turns
   count=$(turn_count)
-  unlock
   printf 'agent-to-agent sends: %s/20\n' "$count"
   for f in "$PPI_HOME"/panes/*; do
     [ -e "$f" ] || continue
@@ -703,6 +702,7 @@ cmd_who() {
     alias_jq "$alias" "who_line($operator)" -r
   done
   who_dispatcher "$operator"
+  who_locks "$operator"
   # An agent polling for its own reply cannot receive it mid-turn; say so where it is looking.
   if [ -n "${PPI_ALIAS:-}" ] && queued "$PPI_ALIAS"; then
     echo "ppi: messages queued for $PPI_ALIAS (you) arrive only after you stop; finish your response now instead of waiting."
@@ -989,6 +989,23 @@ def recent($r; $owner): [times($r; $owner)[] | select(now - . < 60)];
 '
 # A record file's content when it is a JSON object, else nothing.
 record() { jq -c 'objects' "$1" 2>/dev/null || true; }
+
+# Locks held 10 s or more. That is a reporting threshold, not a bound on a live holder: a send waits
+# about 7 s for a recipient lock while it holds .turns, and a slow or paused command holds a lock
+# longer. A lock records no owner, so its age is all who can report. The recovery, for the operator
+# only, removes a lock only once the bus is quiet: nothing new starts and nothing running remains.
+LOCK_REPORT_AGE=10
+who_locks() { # operator
+  local d name age
+  for d in "$PPI_HOME"/locks/*.lock "$PPI_HOME"/locks/.*.lock; do
+    [ -d "$d" ] || continue
+    age=$(perl -e '@s = stat shift; print @s ? time - $s[9] : 0' "$d")
+    [ "$age" -ge "$LOCK_REPORT_AGE" ] || continue
+    name=${d##*/}
+    printf 'lock %s: held %ss; owner unknown\n' "${name%.lock}" "$age"
+    [ "$1" = false ] || printf '  recovery: stop the dispatcher, keep the operator and every agent from sending or prompting, and wait for every running ppi command and hook to finish; if this lock is still held then, rmdir %q\n' "$d"
+  done
+}
 
 # The dispatcher line of ppi who. A restart command follows, for the operator only, when the next
 # ppi dispatch would take the lock.
