@@ -514,10 +514,15 @@ cmd_batch() {
       registered "$a"
       parse_snapshots "$@"
       # The counter is taken under .turns before the recipient lock, the order ppi send uses.
+      # One try at the recipient lock: waiting would hold .turns, and a hook can keep the lock for
+      # its whole deadline; a busy lock holds this alias until a later pass.
       lock .turns
-      lock "$a"
-      out=$(alias_jq "$a" '($counter | rtrimstr("\n") | if . == "" then 0 else tonumber end) as $n | tick($n)' \
-        --rawfile counter <(cat_if "$PPI_HOME/counter"))
+      if lock_try "$a" 0; then
+        out=$(alias_jq "$a" '($counter | rtrimstr("\n") | if . == "" then 0 else tonumber end) as $n | tick($n)' \
+          --rawfile counter <(cat_if "$PPI_HOME/counter"))
+      else
+        out='{"out":{"action":"hold","reason":"locked"},"writes":[]}'
+      fi
       ;;
     check)
       a=$(batch_alias "$1")
@@ -537,8 +542,11 @@ cmd_batch() {
       a=$1
       valid_name participant "$a"
       registered "$a"
-      lock "$a"
-      out=$(alias_jq "$a" restart)
+      if lock_try "$a" 0; then
+        out=$(alias_jq "$a" restart)
+      else
+        out='{"out":{"result":"locked"},"writes":[]}'
+      fi
       ;;
     *) die "$usage" ;;
   esac

@@ -707,6 +707,15 @@ check "/ready refuses when a prompt arrives between its read and its write" fail
 check "a refused /ready writes no baseline" [ ! -e "$SYN/ready/sa" ]
 check "the arm still holds after the refusal" hold_is "$(stick sa)" no-stop
 
+# A busy alias lock holds that alias for the pass: neither tick nor the start reconciliation waits for it.
+mkdir "$SYN/locks/sa.lock"
+out=$(stick sa) || out="exit $?"
+check "tick holds an alias whose lock is busy, reason locked" hold_is "$out" locked
+check "and leaves no .turns lock behind" [ ! -e "$SYN/locks/.turns.lock" ]
+out=$(syn "$PPI" batch restart sa) || out="exit $?"
+check "the start reconciliation reports a busy alias lock as locked" quiet_jq -e '.result == "locked"' <<<"$out"
+rmdir "$SYN/locks/sa.lock"
+
 # A missed observation after startup validation, then a blocked prompt's done re-report.
 shook sa stop "$(stop_in S1 P4)"
 mkdir "$SYN/locks/sa.lock"
@@ -961,7 +970,8 @@ turn() {
   status working
   case $1 in
     *standin:missed*)
-      mkdir "$PPI_HOME/locks/$me.lock"
+      # The dispatcher's tick takes this lock briefly on every pass.
+      until mkdir "$PPI_HOME/locks/$me.lock" 2>/dev/null; do sleep 0.05; done
       hook prompt "$1"
       rmdir "$PPI_HOME/locks/$me.lock"
       status done
@@ -1320,9 +1330,17 @@ check "who reports a lock whose owner's program exited as stopped and replaceabl
   "dispatcher: stopped; its program in $DISP3 exited; the next ppi dispatch replaces this lock" <<<"$who_out"
 check "with the restart command" grep -q '^  restart: ' <<<"$who_out"
 check "the killed supervisor's script does not outlive it" eventually gone_pid "$SCRIPT3"
+# A stale alias lock at the start holds that alias, not the bus: the script keeps running and
+# reconciles the alias once the lock is gone.
+mkdir "$DH/locks/si.lock"
 DISP4=$(dispatcher_pane bus4)
 check "the next dispatcher replaces an owner whose program exited" eventually owner_is "$DISP4"
 check "the replacement stops the old owner's reader" eventually gone_pid "$R3"
+check "a start that finds an alias lock held says so" eventually captured "$DISP4" "si: lock held; reconciliation retried each pass"
+rmdir "$DH/locks/si.lock"
+check "the alias is reconciled once its lock is free" eventually captured "$DISP4" "si: reconciled"
+no_restart_by_owner() { ! jq -e --argjson o "$(owner_pid)" '.owner == $o' "$DH/dispatcher.lock/restarts" >/dev/null 2>&1; }
+check "and the script never restarted" no_restart_by_owner
 
 # Closing the owner's block while a successor starts. The old cleanup's ownership check and removal
 # wait on .dispatch like the takeover, so either order leaves the successor owning the lock.

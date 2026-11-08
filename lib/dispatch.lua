@@ -125,13 +125,31 @@ local function deliver(d)
   end)
 end
 
+-- Aliases whose start reconciliation found their lock busy. Each is retried every pass and gets
+-- no tick until it succeeds, so an attempt the last script left unresolved is held first.
+local unreconciled = {}
+local function reconcile(a)
+  local r, err = ppi("batch", "restart", a)
+  if not r then fatal(err) end
+  if r.result == "locked" then
+    if not unreconciled[a] then say(a .. ": lock held; reconciliation retried each pass") end
+    unreconciled[a] = true
+  elseif unreconciled[a] then
+    unreconciled[a] = nil
+    say(a .. ": reconciled")
+  end
+end
+
 local function pass()
   for _, a in ipairs(aliases()) do
-    local d = tick(a)
-    if d.action == "status" then
-      d = tick(a, snapshot(block_of(a) or fatal("no block recorded for " .. a)))
+    if unreconciled[a] then reconcile(a) end
+    if not unreconciled[a] then
+      local d = tick(a)
+      if d.action == "status" then
+        d = tick(a, snapshot(block_of(a) or fatal("no block recorded for " .. a)))
+      end
+      if d.action == "paste" then deliver(d) end
     end
-    if d.action == "paste" then deliver(d) end
   end
   local f = io.open(HOME .. "/heartbeat", "w")
   if f then f:close() end
@@ -196,17 +214,14 @@ put(HOME .. "/dispatcher.lock/reader", rex.json.encode({
   pid = reader.pid, start = (started.stdout:gsub("^%s+", ""):gsub("%s+$", "")),
 }))
 
-for _, a in ipairs(aliases()) do
-  local _, err = ppi("batch", "restart", a)
-  if err then fatal(err) end
-end
+for _, a in ipairs(aliases()) do reconcile(a) end
 
 rex.on("terminal.program_status_changed", wake)
 rex.on("terminal.program_status_removed", wake)
 rex.on("terminal.child_exited", wake)
 rex.on("block_closed", function(_, ev)
   for _, a in ipairs(aliases()) do
-    if block_of(a) == ev.block_id then tick(a, { "--closed" }) end
+    if block_of(a) == ev.block_id and not unreconciled[a] then tick(a, { "--closed" }) end
   end
 end)
 rex.every(1, pass)
