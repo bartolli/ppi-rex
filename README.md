@@ -1,141 +1,132 @@
-# ppi — Ping Pong Interactive
+# ppi
 
-**A zero-daemon local message bus for orchestrating CLI coding agents (Claude Code, OpenAI Codex) and a human operator in [Rex](https://www.superlogical.com/rex/docs) panes.**
+Local message bus for Claude Code and Codex agents plus one operator, each in a [Rex](https://www.superlogical.com/rex/docs) pane. `ppi send` queues to disk, and a dispatcher in its own Rex tab pastes an agent's queue only when that agent is at its prompt.
 
-`ppi` turns a Rex session into a multi-agent workspace: AI coding agents collaborate side-by-side with human-in-the-loop oversight, all in one Bash script that drives Rex through its `rex` CLI.
+## Requirements
 
-- **Zero infrastructure:** Pure Bash, `jq`, and the `rex` CLI that ships with Rex. No background service. State lives in `/tmp/ppi-<uid>/rex-<session id>`.
-- **Safe to leave installed:** Outside a `ppi` session, the plugin hooks find no `PPI_BIN` and exit `0` immediately.
-- **Built-in loop guard:** Caps agent-to-agent traffic at 20 messages until the human operator sends again. Over-limit sends are refused and logged as `blocked`; messages to the operator always pass.
-- **Prompt-injection aware:** The injected contract tells each agent that a message from another agent is a request, never the user's approval: it cannot approve a permission prompt or authorize new work.
+- macOS Rex, Bash 3.2+, `jq`, and the system perl. Nothing runs outside Rex.
+- Tested with Rex `0.0.1793981048-g01d6c4` (API 11), Claude Code 2.1.319, and Codex CLI 0.167.0.
 
-**Requirements:** Rex, `jq`, and Bash `3.2+`. `rex` is on `PATH` inside every Rex pane, which is where `ppi` runs. This is the Rex edition of ppi; it carries no code for other multiplexers.
+## How it works
+
+1. The SessionStart hook prints the bus contract. It tells the agent to reply only with `"$PPI_BIN" send` and never to treat another agent's message as operator approval.
+2. `ppi send` appends to the recipient's queue. It never types into a pane.
+3. The dispatcher, a supervised `rex do` Lua script, pastes an agent's queue as one **batch**. It pastes only while the agent is validated, at its prompt, and has nothing outstanding. Until then the agent is **held**.
+4. Hooks record prompts and turn ends. The Stop matching the batch's prompt releases the batch. Anything else leaves it **uncertain** until the operator resolves it (see [Recovery](#recovery)).
+
+Agent-to-agent sends stop at 20 per operator message. Sends to the operator always pass.
+
+State lives in `/tmp/ppi-<uid>/rex-<session-id>`. The [internals doc](docs/documentation.md) covers the state model and every failure case.
 
 ## Install
 
-**Review `bin/ppi` first**, then symlink it onto your `PATH`:
+1. Clone and link the CLI. `ppi` resolves its symlink, so agents and hooks run the clone, and `git pull` updates it.
 
-```sh
-git clone <this repository> /path/to/ppi
-ln -s /path/to/ppi/bin/ppi ~/.local/bin/ppi
-```
+   ```sh
+   git clone https://github.com/bartolli/ppi-rex ~/src/ppi-rex
+   mkdir -p ~/.local/bin && ln -sf ~/src/ppi-rex/bin/ppi ~/.local/bin/ppi
+   ls -l "$(command -v ppi)"   # must point into ~/src/ppi-rex; otherwise fix PATH or an older ppi
+   ```
 
-### Claude Code Plugin
+2. Install the plugin in each harness you use. Its hooks are no-ops outside a ppi pane (no `PPI_BIN`).
 
-```sh
-claude plugin marketplace add /path/to/ppi
-claude plugin install ppi@ppi
-```
+   ```sh
+   claude plugin marketplace add ~/src/ppi-rex && claude plugin install ppi@ppi
+   codex plugin marketplace add ~/src/ppi-rex && codex plugin add ppi@ppi
+   ```
 
-Pre-approve `ppi` in `~/.claude/settings.json` so agent sends don't pause for confirmation:
+3. Trust the Codex plugin hooks before the first `ppi up`. Run `codex` in the project, choose **Trust all**, then `/quit`. Trust is per profile, so add `-p <profile>` if the arm uses one.
+4. Allow agents to run `"$PPI_BIN" send` and `"$PPI_BIN" who`, or approve each on prompt.
 
-```json
-{
-  "permissions": {
-    "allow": ["Bash(ppi send:*)", "Bash(ppi who)"]
-  }
-}
-```
+## Usage
 
-### OpenAI Codex Plugin
+1. Write the arms config. `ppi up` reads the path you pass, else `ppi.config.json` in the project, else `$XDG_CONFIG_HOME/ppi/config.json` (default `~/.config/ppi/config.json`). [Config](#config) lists the arm keys.
 
-```sh
-codex plugin marketplace add /path/to/ppi
-codex plugin add ppi@ppi
-```
+   ```json
+   { "arms": [
+     { "name": "claude", "runtime": "claude", "model": "haiku" },
+     { "name": "codex",  "runtime": "codex",  "model": "gpt-6-luna" }
+   ] }
+   ```
 
-Codex prompts you to trust the plugin and its hooks on first use. Accept, then restart Codex. Changed hooks are marked for review again.
+2. From a Rex pane in the project, run `ppi up [config]`.
+   - Agents open side by side above this pane.
+   - This pane becomes the operator console.
+   - The dispatcher runs in a `ppi bus` tab.
+   - An arm receives nothing until its startup prompt's turn has ended.
 
-## Quick Start
+### Console
 
-### Create `ppi.config.json`
-
-Place a config file in your project root, or globally at `~/.config/ppi/config.json`:
-
-```json
-{
-  "arms": [
-    { "name": "claude", "runtime": "claude", "model": "haiku" },
-    { "name": "codex", "runtime": "codex", "model": "gpt-6-luna", "profile": "supervisor" },
-    { "name": "planner", "runtime": "claude", "command": ["claude", "--model", "opus", "--permission-mode", "plan"] }
-  ]
-}
-```
-
-### Launch the Workspace
-
-In a Rex pane, from your project directory:
-
-```sh
-cd ~/your-project
-ppi up                 # uses ./ppi.config.json or ~/.config/ppi/config.json
-ppi up custom.json     # or pass an explicit config file
-```
-
-`ppi up` builds the workspace around the pane it runs in: the agents open side by side above it, the pane becomes the **operator console**, and the bus monitor runs in a **ppi bus** tab. The agents start in the directory `ppi up` runs from, so that directory is their workspace. `/quit` returns you to your shell while the agents keep running; `ppi console` rejoins them. A Rex session holds one workspace at a time.
-
-### Orchestrate from the Operator Console
-
-```text
-operator> @claude Ask @codex to review your changes in src/auth.ts
-operator> /who
-operator> /release codex
-operator> /quit
-```
-
-| Console Command | Action |
+| Command | Effect |
 | :--- | :--- |
-| `@<agent> <message>` | Send an instruction to an agent (resets the `20/20` agent-to-agent message counter). |
-| `/who` | Show message count (`X/20`), participant pane IDs, states (`starting`, `idle`, `busy`), and queue depths. |
-| `/release <agent>` | Recover a stuck agent sitting at its prompt (delivers queued messages or marks it `idle`). |
-| `/quit` | Exit the operator console; the agents keep running. |
-| *(incoming)* | Messages agents send to `operator` print in the console as they arrive, as `[ppi from=<agent> to=operator id=<id>] <msg>`. |
-| **ppi bus** tab | The bus log. It also delivers messages for sandboxed agents, so keep it open. |
+| `@<alias> <msg>` | Send. Resets the agent-to-agent count. |
+| `/who` | Turn count, participants, queues, holds, batches, dispatcher, stale locks. |
+| `/requeue <batch>` | Queue an uncertain batch's messages again, in a new batch. |
+| `/dismiss <batch>` | Close an uncertain batch without a retry. |
+| `/ready <alias>` | Confirm the agent is at a clean prompt and lift its hold. |
+| `/quit` | Leave. Agents keep running; `ppi console` rejoins. |
 
-## Configuration Rules
+Incoming messages print as `[ppi from=<alias> to=operator id=<id>] …`, and ppi's notices as `[ppi] …`. A message to the operator, an uncertain batch, or a stopped or unresponsive dispatcher sets the console pane's Rex status to Blocked until your next input line.
 
-Each entry in `"arms"` defines one agent pane:
+## Recovery
 
-- **`claude` preset:** Supports optional `"model"`.
-- **`codex` preset:** Supports optional `"model"` and `"profile"`. Launches with `-s workspace-write` and a one-line startup prompt so Codex initializes its session hooks.
-- **Custom `"command"`:** An array of strings executed directly (`["claude", "--model", "opus"]`). No shell expansion (`~` or `$VAR`) or preset defaults are applied. Optional `"runtime"` sets `PPI_RUNTIME` for hooks; `"model"` and `"profile"` are not allowed alongside `"command"`.
+| Situation | Action |
+| :--- | :--- |
+| Uncertain batch (interrupted turn, blocked prompt, no Stop, agent exit, restart mid-delivery) | Inspect the agent, then `/requeue <batch>` or `/dismiss <batch>`. If ppi says the agent is still held, clear its input and `/ready <alias>`. |
+| Prompt typed into an agent pane, then cancelled | The agent stays held until `/ready <alias>`. |
+| Dispatcher stopped | `/who` prints `restart from a shell: <cmd>`. Run it in a new tab of the same Rex window, then close the old `ppi bus` pane, which is inert. A crashed script restarts by itself, at most 5 times a minute. |
+| Stale lock | `/who` reports locks held 10 s or more, with removal steps. |
 
-Models are not checked: a wrong model fails inside its pane after it starts, and `/who` shows the arm stuck at `starting`.
+[Transitions](docs/documentation.md#transitions) in the internals doc lists every way a batch becomes uncertain.
 
-Agent panes start from the login shell's environment plus the `PATH` that `ppi up` ran with, so programs installed by your interactive shell setup, such as an nvm-installed `claude`, are found. `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are passed through when set.
+## Config
 
-## CLI Reference
+Each arm uses the `claude` preset, the `codex` preset, or its own `command`.
+
+| Key | Arm | Meaning |
+| :--- | :--- | :--- |
+| `name` | All | The alias the arm registers under. Unique, using `a-z`, `0-9`, `_`, and `-`. `operator` is reserved. |
+| `runtime` | All | `claude` or `codex` for the presets. A `command` arm requires it too, set to `claude`, `codex`, or the app it reports to Rex. |
+| `model` | `claude`, `codex` presets | Model to run. |
+| `profile` | `codex` preset | Codex profile. `$CODEX_HOME/<profile>.config.toml` must exist (default `~/.codex`). |
+| `command` | Command | argv array, with no shell expansion and no preset defaults. Put any model or profile flags in it. It has no startup prompt, so type the first prompt into its pane to validate it. |
+
+- Unknown keys are rejected.
+- The `codex` preset runs with `-s workspace-write`.
+- Panes get the login-shell environment plus `ppi up`'s `PATH`. `CODEX_HOME` and `CLAUDE_CONFIG_DIR` pass through.
+
+## CLI
 
 ```text
-ppi up [config]                            build the workspace around this Rex pane
-ppi console                                start the interactive operator prompt
-ppi monitor                                tail bus.jsonl and deliver pending sandboxed messages
-ppi who                                    list message count, participants, panes, and states
-ppi send <to> <message...>                 message a participant (or pass message via stdin)
-ppi release <alias>                        deliver an agent's queue or mark it idle
-ppi deliver <alias>                        deliver an agent's queue if currently idle
-ppi run [--runtime <name>] <alias> ...     register this Rex pane as <alias> and exec command
-ppi hook <session-start|prompt|stop|idle>  lifecycle hook entry points
+ppi up [config]                      build the workspace around this Rex pane
+ppi console                          operator console
+ppi who                              participants, holds, batches, dispatcher
+ppi send <to> <message...>           queue a message (or stdin)
+ppi ready <alias>                    the agent is at a clean prompt
+ppi run --runtime <name> <alias> <command> [args...]
+                                     register this pane as <alias>, then exec the agent
+ppi dispatch                         dispatcher; the ppi bus tab's own program
+ppi batch <operation> ...            queue operations for the dispatcher and console
+ppi hook <session-start|prompt|stop|interrupt>
+                                     plugin hook entry points
 ```
-
-## How It Works
-
-1. **Context Injection:** On `session-start`, `ppi` marks the agent `idle` and prints the bus contract, so the agent knows how to call `ppi who` and `ppi send <to> <<'EOF'`. After a mid-turn context compaction the contract is printed again, but the state is left alone.
-2. **Queueing & Delivery:**
-   - If a recipient is `idle`, `ppi send` pastes `[ppi from=<sender> to=<recipient> id=<id>] <msg>` into its pane as one bracketed paste, then presses Enter.
-   - If a recipient is `busy`, the message queues on disk. When the recipient finishes its turn, its `Stop` hook blocks exit and feeds the queued messages back as the next prompt.
-   - Claude only: the `idle_prompt` notification marks the agent `idle` and delivers its queue, which recovers an agent left `busy` by an interrupted turn.
-3. **Sandboxed Delivery (Codex):** Codex panes run in `workspace-write` mode without access to the Rex socket. When Codex runs `ppi send`, the message is logged as `pending`, and the unsandboxed `ppi monitor` in the **ppi bus** tab delivers it into the target pane.
 
 ## Development
 
-Edit `bin/ppi` directly. Running panes and hooks pick up changes on their next call, since nothing is copied.
+- `bin/ppi` is live. Panes and hooks run it on their next call.
+- After changing a `hooks.json`, follow these steps.
+  1. Bump `version` in both plugin manifests.
+  2. Run `claude plugin update ppi@ppi` and `codex plugin add ppi@ppi`.
+  3. Restart the agents.
+  4. Re-trust the Codex hooks.
+- The smoke test takes about 2 min in its own Rex session and needs BSD `script` and perl `MIME::Base64`. Set `REX_BIN_DIR` only outside a Rex pane.
 
-If you edit a `hooks.json`, bump `version` in both plugin manifests, then run `claude plugin update ppi@ppi` and `codex plugin add ppi@ppi` again. Do the Codex update before starting a Codex arm: a Codex arm that finds a new version reinstalls the plugin itself and deletes the old cache folder, and any Codex arm still running loses its hooks. Restart the agent panes and review any Codex hooks marked as changed.
+  ```sh
+  REX_BIN_DIR='/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS' /bin/bash test/smoke-rex.sh
+  ```
 
-The smoke test opens and closes its own Rex session. Run it from a Rex pane, or set `REX_BIN_DIR` to the directory holding the `rex` CLI:
+- Design and internals are in [docs/documentation.md](docs/documentation.md).
 
-```sh
-/bin/bash /path/to/ppi/test/smoke-rex.sh
-REX_BIN_DIR='/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS' /bin/bash /path/to/ppi/test/smoke-rex.sh
-```
+## License
+
+MIT

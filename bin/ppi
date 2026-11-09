@@ -153,7 +153,7 @@ read_rex() { # block
 }
 
 # The state model. Every decision is one jq program over one alias's records (bus, below);
-# it returns {out, writes} and bash only applies the writes, in order. See docs/plan.md.
+# it returns {out, writes} and bash only applies the writes, in order. See docs/documentation.md.
 JQ_LIB='
 def ts: try (capture("^(?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?<f>[.][0-9]+)?(?<z>Z|[+-][0-9]{2}:[0-9]{2})$")
     | ((.d + "Z") | fromdateiso8601) + (("0" + (.f // "")) | tonumber)

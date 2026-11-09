@@ -1383,7 +1383,7 @@ R4=$(reader_pid)
 SUP4=$(owner_pid)
 mkdir "$DH/locks/.dispatch.lock"
 "$REX" block close -s "$SMOKE_SESSION" "$DISP4"
-# The successor starts with the restart command docs/plan.md gives.
+# The successor starts with the restart command docs/documentation.md gives.
 DISP5=$("$REX" --autostart=false --timeout 15s window new -s "$SMOKE_SESSION" "ppi bus" \
   --shell=none --keep-open --focus=false --json -- env PPI_HOME="$DH" "$PPI" dispatch | jq -r '.block_ids[0] // ""')
 sleep 1

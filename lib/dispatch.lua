@@ -13,6 +13,8 @@ local function say(msg) print(os.date("%H:%M:%S") .. " ppi: " .. msg) end
 local function fatal(msg) error(msg, 0) end
 
 -- One ppi subcommand: its JSON result, or nil and why it failed.
+---@return table? result
+---@return string? err
 local function ppi(...)
   local argv = { BASH, PPI, ... }
   local r, err = rex.exec(argv, { env = ENV, timeout = 20 })
@@ -130,7 +132,7 @@ end
 local unreconciled = {}
 local function reconcile(a)
   local r, err = ppi("batch", "restart", a)
-  if not r then fatal(err) end
+  if not r then return fatal(err) end
   if r.result == "locked" then
     if not unreconciled[a] then say(a .. ": lock held; reconciliation retried each pass") end
     unreconciled[a] = true

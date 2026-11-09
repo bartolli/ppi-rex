@@ -1,3 +1,5 @@
 .DS_Store
 .logs/
 test/probe/out/
+docs/intent.md
+docs/plan.md
